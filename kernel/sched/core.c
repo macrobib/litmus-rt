@@ -89,6 +89,7 @@
 #include <litmus/litmus.h>
 #include <litmus/trace.h>
 #include <litmus/sched_trace.h>
+#include <litmus/sched_plugin.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
@@ -4131,7 +4132,9 @@ __setscheduler(struct rq *rq, struct task_struct *p, int policy, int prio)
 	__setscheduler_params(p, policy, prio);
 	/* we are holding p->pi_lock already */
 	p->prio = rt_mutex_getprio(p);
-	if (rt_prio(p->prio))
+	if (p->policy == SCHED_LITMUS)
+		p->sched_class = &litmus_sched_class;
+	else if (rt_prio(p->prio))
 		p->sched_class = &rt_sched_class;
 	else
 		p->sched_class = &fair_sched_class;
@@ -4162,6 +4165,7 @@ static int __sched_setscheduler(struct task_struct *p, int policy,
 	const struct sched_class *prev_class;
 	struct rq *rq;
 	int reset_on_fork;
+	int litmus_task = 0;
 
 	/* may grab non-irq protected spin_locks */
 	BUG_ON(in_interrupt());
@@ -4176,7 +4180,7 @@ recheck:
 
 		if (policy != SCHED_FIFO && policy != SCHED_RR &&
 				policy != SCHED_NORMAL && policy != SCHED_BATCH &&
-				policy != SCHED_IDLE)
+				policy != SCHED_IDLE && policy != SCHED_LITMUS)
 			return -EINVAL;
 	}
 
@@ -4190,6 +4194,8 @@ recheck:
 	    (!p->mm && param->sched_priority > MAX_RT_PRIO-1))
 		return -EINVAL;
 	if (rt_policy(policy) != (param->sched_priority != 0))
+		return -EINVAL;
+	if (policy == SCHED_LITMUS && policy == p->policy)
 		return -EINVAL;
 
 	/*
@@ -4230,6 +4236,12 @@ recheck:
 
 	if (user) {
 		retval = security_task_setscheduler(p);
+		if (retval)
+			return retval;
+	}
+
+	if (policy == SCHED_LITMUS) {
+		retval = litmus_admit_task(p);
 		if (retval)
 			return retval;
 	}
@@ -4286,6 +4298,12 @@ recheck:
 	}
 
 	p->sched_reset_on_fork = reset_on_fork;
+
+	if (p->policy == SCHED_LITMUS) {
+		litmus_exit_task(p);
+		litmus_task = 1;
+	}
+
 	oldprio = p->prio;
 
 	/*
@@ -4313,6 +4331,16 @@ recheck:
 	prev_class = p->sched_class;
 	__setscheduler(rq, p, policy, param->sched_priority);
 
+	if (policy == SCHED_LITMUS) {
+#ifdef CONFIG_SMP
+		p->rt_param.stack_in_use = running ? rq->cpu : NO_CPU;
+#else
+		p->rt_param.stack_in_use = running ? 0 : NO_CPU;
+#endif
+		p->rt_param.present = running;
+		litmus->task_new(p, on_rq, running);
+	}
+
 	if (running)
 		p->sched_class->set_curr_task(rq);
 	if (on_rq) {
@@ -4326,6 +4354,9 @@ recheck:
 	task_rq_unlock(rq, p, &flags);
 
 	rt_mutex_adjust_pi(p);
+
+	if (litmus_task)
+		litmus_dealloc(p);
 
 	return 0;
 }
