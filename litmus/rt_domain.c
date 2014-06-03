@@ -243,7 +243,10 @@ static void arm_release_timer(rt_domain_t *_rt)
 			 * as it may deadlock on rq->lock
 			 *
 			 * PINNED mode is ok on both local and remote CPU
+			 *
+			 * The callback must run in hard IRQ context.
 			 */
+			 rh->timer.irqsafe = 1;
 #ifdef CONFIG_RELEASE_MASTER
 			if (rt->release_master == NO_CPU &&
 			    target_cpu == NO_CPU)

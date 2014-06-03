@@ -1124,6 +1124,7 @@ static int __init init_pfair(void)
 	for (cpu = 0; cpu < num_online_cpus(); cpu++)  {
 		state = &per_cpu(pfair_state, cpu);
 		hrtimer_init(&state->quantum_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
+		state->quantum_timer.irqsafe = 1; /* must run in hard IRQ context */
 		state->quantum_timer.function = on_quantum_boundary;
 		state->topology.id = cpu;
 		state->cur_tick   = 0;
