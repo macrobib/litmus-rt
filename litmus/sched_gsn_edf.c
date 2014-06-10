@@ -24,6 +24,7 @@
 #include <litmus/budget.h>
 
 #include <litmus/bheap.h>
+#include <litmus/sbinheap.h>
 
 #ifdef CONFIG_SCHED_CPU_AFFINITY
 #include <litmus/affinity.h>
@@ -107,15 +108,15 @@ typedef struct  {
 	int 			cpu;
 	struct task_struct*	linked;		/* only RT tasks */
 	struct task_struct*	scheduled;	/* only RT tasks */
-	struct bheap_node*	hn;
+	sbinheap_node_t		hn;
 } cpu_entry_t;
 DEFINE_PER_CPU(cpu_entry_t, gsnedf_cpu_entries);
 
 cpu_entry_t* gsnedf_cpus[NR_CPUS];
 
 /* the cpus queue themselves according to priority in here */
-static struct bheap_node gsnedf_heap_node[NR_CPUS];
-static struct bheap      gsnedf_cpu_heap;
+static struct sbinheap_node gsnedf_heap_node[NR_CPUS];
+static struct sbinheap   gsnedf_cpu_heap;
 
 static rt_domain_t gsnedf;
 #define gsnedf_lock (gsnedf.ready_lock)
@@ -126,11 +127,12 @@ static rt_domain_t gsnedf;
 #define WANT_ALL_SCHED_EVENTS
  */
 
-static int cpu_lower_prio(struct bheap_node *_a, struct bheap_node *_b)
+static int cpu_lower_prio(const struct sbinheap_node *_a,
+				const struct sbinheap_node *_b)
 {
-	cpu_entry_t *a, *b;
-	a = _a->value;
-	b = _b->value;
+	const cpu_entry_t *a = sbinheap_entry(_a, cpu_entry_t, hn);
+	const cpu_entry_t *b = sbinheap_entry(_b, cpu_entry_t, hn);
+
 	/* Note that a and b are inverted: we want the lowest-priority CPU at
 	 * the top of the heap.
 	 */
@@ -142,17 +144,16 @@ static int cpu_lower_prio(struct bheap_node *_a, struct bheap_node *_b)
  */
 static void update_cpu_position(cpu_entry_t *entry)
 {
-	if (likely(bheap_node_in_heap(entry->hn)))
-		bheap_delete(cpu_lower_prio, &gsnedf_cpu_heap, entry->hn);
-	bheap_insert(cpu_lower_prio, &gsnedf_cpu_heap, entry->hn);
+	if (likely(sbinheap_is_in_heap(&entry->hn)))
+		sbinheap_delete(&entry->hn, &gsnedf_cpu_heap);
+
+	sbinheap_add(&entry->hn, &gsnedf_cpu_heap, cpu_entry_t, hn);
 }
 
 /* caller must hold gsnedf lock */
 static cpu_entry_t* lowest_prio_cpu(void)
 {
-	struct bheap_node* hn;
-	hn = bheap_peek(cpu_lower_prio, &gsnedf_cpu_heap);
-	return hn->value;
+	return sbinheap_top_entry(&gsnedf_cpu_heap, cpu_entry_t, hn);
 }
 
 
@@ -648,10 +649,8 @@ static void set_priority_inheritance(struct task_struct* t, struct task_struct* 
 		 * We can't use heap_decrease() here since
 		 * the cpu_heap is ordered in reverse direction, so
 		 * it is actually an increase. */
-		bheap_delete(cpu_lower_prio, &gsnedf_cpu_heap,
-			    gsnedf_cpus[linked_on]->hn);
-		bheap_insert(cpu_lower_prio, &gsnedf_cpu_heap,
-			    gsnedf_cpus[linked_on]->hn);
+		sbinheap_delete(&gsnedf_cpus[linked_on]->hn, &gsnedf_cpu_heap);
+		sbinheap_add(&gsnedf_cpus[linked_on]->hn, &gsnedf_cpu_heap, cpu_entry_t, hn);
 	} else {
 		/* holder may be queued: first stop queue changes */
 		raw_spin_lock(&gsnedf.release_lock);
@@ -994,14 +993,19 @@ static long gsnedf_activate_plugin(void)
 	int cpu;
 	cpu_entry_t *entry;
 
-	bheap_init(&gsnedf_cpu_heap);
+	gsnedf_cpu_heap.compare = cpu_lower_prio;
+	gsnedf_cpu_heap.size = 0;
+	gsnedf_cpu_heap.max_size = num_online_cpus();
+	gsnedf_cpu_heap.buf = &gsnedf_heap_node[0];
+	INIT_SBINHEAP(&gsnedf_cpu_heap);
+
 #ifdef CONFIG_RELEASE_MASTER
 	gsnedf.release_master = atomic_read(&release_master_cpu);
 #endif
 
 	for_each_online_cpu(cpu) {
 		entry = &per_cpu(gsnedf_cpu_entries, cpu);
-		bheap_node_init(&entry->hn, entry);
+		INIT_SBINHEAP_NODE(&entry->hn);
 		entry->linked    = NULL;
 		entry->scheduled = NULL;
 #ifdef CONFIG_RELEASE_MASTER
@@ -1052,14 +1056,11 @@ static int __init init_gsn_edf(void)
 	int cpu;
 	cpu_entry_t *entry;
 
-	bheap_init(&gsnedf_cpu_heap);
 	/* initialize CPU state */
 	for (cpu = 0; cpu < NR_CPUS; cpu++)  {
 		entry = &per_cpu(gsnedf_cpu_entries, cpu);
 		gsnedf_cpus[cpu] = entry;
 		entry->cpu 	 = cpu;
-		entry->hn        = &gsnedf_heap_node[cpu];
-		bheap_node_init(&entry->hn, entry);
 	}
 	edf_domain_init(&gsnedf, NULL, gsnedf_release_jobs);
 	return register_sched_plugin(&gsn_edf_plugin);
