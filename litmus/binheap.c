@@ -1,8 +1,8 @@
 #include <litmus/binheap.h>
 
 /* Returns true of the root ancestor of node is the root of the given heap. */
-int binheap_is_in_this_heap(struct binheap_node *node,
-	struct binheap* heap)
+int binheap_is_in_this_heap(const struct binheap_node *node,
+				const struct binheap* heap)
 {
 	if(!binheap_is_in_heap(node)) {
 		return 0;
@@ -31,8 +31,8 @@ static void __update_ref(struct binheap_node *parent,
 static void __binheap_swap(struct binheap_node *parent,
 				struct binheap_node *child)
 {
-	swap(parent->data, child->data);
 	__update_ref(parent, child);
+	swap(parent->data, child->data);
 }
 
 
@@ -43,8 +43,8 @@ static void __binheap_swap_safe(struct binheap *handle,
 				struct binheap_node *a,
 				struct binheap_node *b)
 {
-	swap(a->data, b->data);
 	__update_ref(a, b);
+	swap(a->data, b->data);
 
 	if((a->parent != NULL) && (a->parent == b->parent)) {
 		/* special case: shared parent */
@@ -180,16 +180,39 @@ static void __binheap_update_next(struct binheap *handle)
 }
 
 
+static void __binheap_for_each(struct binheap_node *h,
+				binheap_for_each_t fn, void* args)
+{
+	/* Apply fn to all nodes. Beware of recursion. */
+
+	/* pre-order */
+	fn(h, args);
+
+	if(h->left)
+		__binheap_for_each(h->left, fn, args);
+	if(h->right)
+		__binheap_for_each(h->right, fn, args);
+}
+
+/* Apply fn to each node. */
+void binheap_for_each(struct binheap *heap, binheap_for_each_t fn, void* args)
+{
+	if (!binheap_empty(heap))
+		__binheap_for_each(heap->root, fn, args);
+}
+
 
 /* bubble node up towards root */
 static void __binheap_bubble_up(struct binheap *handle,
 				struct binheap_node *node)
 {
+	const binheap_order_t cmp = handle->compare;
+
 	/* let BINHEAP_POISON data bubble to the top */
 
 	while((node->parent != NULL) &&
 		  ((node->data == BINHEAP_POISON) ||
-		   handle->compare(node, node->parent))) {
+		   cmp(node, node->parent))) {
 			  __binheap_swap(node->parent, node);
 			  node = node->parent;
 	}
@@ -199,11 +222,12 @@ static void __binheap_bubble_up(struct binheap *handle,
 /* bubble node down, swapping with min-child */
 static void __binheap_bubble_down(struct binheap *handle)
 {
+	const binheap_order_t cmp = handle->compare;
 	struct binheap_node *node = handle->root;
 
 	while(node->left != NULL) {
-		if(node->right && handle->compare(node->right, node->left)) {
-			if(handle->compare(node->right, node)) {
+		if(node->right && cmp(node->right, node->left)) {
+			if(cmp(node->right, node)) {
 				__binheap_swap(node, node->right);
 				node = node->right;
 			}
@@ -212,7 +236,7 @@ static void __binheap_bubble_down(struct binheap *handle)
 			}
 		}
 		else {
-			if(handle->compare(node->left, node)) {
+			if(cmp(node->left, node)) {
 				__binheap_swap(node, node->left);
 				node = node->left;
 			}
@@ -229,8 +253,8 @@ void __binheap_add(struct binheap_node *new_node,
 				void *data)
 {
 	new_node->data = data;
-	new_node->ref = new_node;
 	new_node->ref_ptr = &(new_node->ref);
+	new_node->ref = new_node;
 
 	if(!binheap_empty(handle)) {
 		/* insert left side first */
@@ -278,10 +302,11 @@ void __binheap_add(struct binheap_node *new_node,
  * The 'last' node in the tree is then swapped up to the root and bubbled
  * down.
  */
-void __binheap_delete_root(struct binheap *handle,
+void* __binheap_delete_root(struct binheap *handle,
 				struct binheap_node *container)
 {
 	struct binheap_node *root = handle->root;
+	void* data = root->data;
 
 	if(root != container) {
 		/* coalesce */
@@ -352,6 +377,8 @@ void __binheap_delete_root(struct binheap *handle,
 
 	/* mark as removed */
 	container->parent = BINHEAP_POISON;
+
+	return data;
 }
 
 
@@ -359,19 +386,22 @@ void __binheap_delete_root(struct binheap *handle,
  * Delete an arbitrary node.  Bubble node to delete up to the root,
  * and then delete to root.
  */
-void __binheap_delete(struct binheap_node *node_to_delete,
+void* __binheap_delete(struct binheap_node *node_to_delete,
 				struct binheap *handle)
 {
 	struct binheap_node *target = node_to_delete->ref;
-	void *temp_data = target->data;
+	void *data = target->data;
 
-	/* temporarily set data to null to allow node to bubble up to the top. */
+	/* set data to null to allow node to bubble up to the top. */
 	target->data = BINHEAP_POISON;
 
 	__binheap_bubble_up(handle, target);
-	__binheap_delete_root(handle, node_to_delete);
+	(void)__binheap_delete_root(handle, node_to_delete);
 
-	node_to_delete->data = temp_data;  /* restore node data pointer */
+	/* backwards compatibility with old binheap behavior */
+	node_to_delete->data = data;
+
+	return data;
 }
 
 
