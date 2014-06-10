@@ -43,6 +43,7 @@
 #include <litmus/clustered.h>
 
 #include <litmus/bheap.h>
+#include <litmus/sbinheap.h>
 
 #ifdef CONFIG_SCHED_CPU_AFFINITY
 #include <litmus/affinity.h>
@@ -71,7 +72,7 @@ typedef struct  {
 	struct task_struct*	linked;		/* only RT tasks */
 	struct task_struct*	scheduled;	/* only RT tasks */
 	atomic_t		will_schedule;	/* prevent unneeded IPIs */
-	struct bheap_node*	hn;
+	sbinheap_node_t		hn;
 } cpu_entry_t;
 
 /* one cpu_entry_t per CPU */
@@ -97,11 +98,13 @@ typedef struct clusterdomain {
 	/* map of this cluster cpus */
 	cpumask_var_t	cpu_map;
 	/* the cpus queue themselves according to priority in here */
-	struct bheap_node *heap_node;
-	struct bheap      cpu_heap;
+	struct sbinheap	  cpu_heap;
 	/* lock for this cluster */
 #define cluster_lock domain.ready_lock
 } cedf_domain_t;
+
+/* memory for heap nodes is divided up among clusters on activation */
+static struct sbinheap_node cedf_heap_node[NR_CPUS];
 
 /* a cedf_domain per cluster; allocation is done at init/activation time */
 cedf_domain_t *cedf;
@@ -116,11 +119,12 @@ cedf_domain_t *cedf;
  */
 #define VERBOSE_INIT
 
-static int cpu_lower_prio(struct bheap_node *_a, struct bheap_node *_b)
+static int cpu_lower_prio(const struct sbinheap_node *_a,
+				const struct sbinheap_node *_b)
 {
-	cpu_entry_t *a, *b;
-	a = _a->value;
-	b = _b->value;
+	const cpu_entry_t *a = sbinheap_entry(_a, cpu_entry_t, hn);
+	const cpu_entry_t *b = sbinheap_entry(_b, cpu_entry_t, hn);
+
 	/* Note that a and b are inverted: we want the lowest-priority CPU at
 	 * the top of the heap.
 	 */
@@ -134,20 +138,16 @@ static void update_cpu_position(cpu_entry_t *entry)
 {
 	cedf_domain_t *cluster = entry->cluster;
 
-	if (likely(bheap_node_in_heap(entry->hn)))
-		bheap_delete(cpu_lower_prio,
-				&cluster->cpu_heap,
-				entry->hn);
+	if (likely(sbinheap_is_in_heap(&entry->hn)))
+		sbinheap_delete(&entry->hn, &cluster->cpu_heap);
 
-	bheap_insert(cpu_lower_prio, &cluster->cpu_heap, entry->hn);
+	sbinheap_add(&entry->hn, &cluster->cpu_heap, cpu_entry_t, hn);
 }
 
 /* caller must hold cedf lock */
 static cpu_entry_t* lowest_prio_cpu(cedf_domain_t *cluster)
 {
-	struct bheap_node* hn;
-	hn = bheap_peek(cpu_lower_prio, &cluster->cpu_heap);
-	return hn->value;
+	return sbinheap_top_entry(&cluster->cpu_heap, cpu_entry_t, hn);
 }
 
 
@@ -670,7 +670,6 @@ static void cleanup_cedf(void)
 	if (clusters_allocated) {
 		for (i = 0; i < num_clusters; i++) {
 			kfree(cedf[i].cpus);
-			kfree(cedf[i].heap_node);
 			free_cpumask_var(cedf[i].cpu_map);
 		}
 
@@ -779,10 +778,13 @@ static long cedf_activate_plugin(void)
 
 		cedf[i].cpus = kmalloc(cluster_size * sizeof(cpu_entry_t),
 				GFP_ATOMIC);
-		cedf[i].heap_node = kmalloc(
-				cluster_size * sizeof(struct bheap_node),
-				GFP_ATOMIC);
-		bheap_init(&(cedf[i].cpu_heap));
+
+		cedf[i].cpu_heap.compare = cpu_lower_prio;
+		cedf[i].cpu_heap.size = 0;
+		cedf[i].cpu_heap.max_size = cluster_size;
+		cedf[i].cpu_heap.buf = &cedf_heap_node[i*cluster_size];
+		INIT_SBINHEAP(&cedf[i].cpu_heap);
+
 		edf_domain_init(&(cedf[i].domain), NULL, cedf_release_jobs);
 
 		if(!zalloc_cpumask_var(&cedf[i].cpu_map, GFP_ATOMIC))
@@ -825,8 +827,7 @@ static long cedf_activate_plugin(void)
 				atomic_set(&entry->will_schedule, 0);
 				entry->cpu = ccpu;
 				entry->cluster = &cedf[i];
-				entry->hn = &(cedf[i].heap_node[cpu_count]);
-				bheap_node_init(&entry->hn, entry);
+				INIT_SBINHEAP_NODE(&entry->hn);
 
 				cpu_count++;
 
