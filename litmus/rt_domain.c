@@ -20,7 +20,7 @@
 #include <litmus/trace.h>
 
 #include <litmus/bheap.h>
-
+#include <litmus/fp_common.h>
 /* Uncomment when debugging timer races... */
 #if 0
 #define VTRACE_TASK TRACE_TASK
@@ -348,3 +348,122 @@ void __add_release(rt_domain_t* rt, struct task_struct *task)
 
 	arm_release_timer(rt);
 }
+
+/*EDFVD: Update release heap: Implemented to move the tasks from the release bin 
+ * back to the release queue in appropriate slot during criticality cool down.
+ * */
+void update_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_prio_t higher_prio,int use_task_heap)
+{
+  struct list_head*    pos;
+  struct release_heap* heap = NULL;
+  struct release_heap* rh;
+  unsigned int slot;
+  struct task_struct* t = NULL;
+  lt_t release_time;
+  struct bheap_node* node = NULL;
+
+/*EDFVD: step1: retrieve the min prio task from release bin.
+*/
+  node = bheap_take(higher_prio,release_bin);
+  while(node){
+    t = bheap2task(node);
+    release_time = get_release(t);
+    if(release_time < litmus_clock()){
+        /*While arming the timer the time should be in future
+         * to avoid stale tasks being left in the release queue.
+         * */
+         release_time = litmus_clock() + get_rt_period(t);
+         slot = time2slot(release_time);
+    }
+    else{
+         slot = time2slot(release_time);
+    }
+    /*EDFVD: step2 :Find the time slot for release and Insert to the appropriate slot*/
+    pos = rt->release_queue.slot[slot].next;
+    list_for_each(pos,&rt->release_queue.slot[slot]){
+      rh = list_entry(pos,struct release_heap,list);
+      if(heap->release_time == release_time){
+          heap = rh;
+          bheap_insert(higher_prio, &rh->heap, tsk_rt(t)->heap_node);
+          break;
+      }
+      else if (lt_before(release_time, rh->release_time)){
+          break;
+      }
+    }
+   /**EDFVD: step3: In case of no appropriate heap entry for release time assign one.
+  */
+    if (!heap && use_task_heap) {
+      /* use pre-allocated release heap */
+        rh = tsk_rt(t)->rel_heap;
+        rh->dom = rt;
+        rh->release_time = release_time;
+        /* add to release queue */
+      list_add(&rh->list, pos->prev);
+      heap = rh;
+   }
+  node = bheap_take(higher_prio,release_bin);
+ }
+  arm_release_timer(rt);
+}
+
+/*EDFVD: Clear out the tasks from release heap based on the 
+ * new criticality change.Brute force way of updating based
+ * on looking up all 127 slots one at a time.
+ * */
+void clear_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_check_t compare,bheap_prio_t higher_prio){
+  struct list_head* pos,*temp = NULL;
+  struct list_head* slot_head = NULL;
+  struct release_heap* rh     = NULL;
+  int slot_pos;
+
+  /*Go through each slot one at a time
+   * */
+  for(slot_pos=0;slot_pos<RELEASE_QUEUE_SLOTS;++slot_pos){
+      pos = &rt->release_queue.slot[slot_pos];
+      slot_head = &rt->release_queue.slot[slot_pos];
+      if(list_empty(slot_head)){
+          continue;
+      }
+      list_for_each_safe(pos,temp,&rt->release_queue.slot[slot_pos]){
+          rh = list_entry(pos,struct release_heap,list);
+          bheap_iterate_clear(compare,higher_prio,&rh->heap,release_bin);
+      }
+  }
+
+}
+
+/*If the task is eligible to run in the current criticality update
+ * the period value accordingly*/
+void replenish_task_for_mode(struct task_struct* t){
+     
+    int deadline_surplus = 0;
+    if(current_criticality >= 2){
+        int x1 = tsk_rt(t)->task_params.mc_param.deadline[current_criticality - 1];
+        int x2 = tsk_rt(t)->task_params.mc_param.deadline[current_criticality - 2];
+
+        deadline_surplus = x1 - x2;
+    }
+    tsk_rt(t)->job_params.deadline += deadline_surplus;
+}
+
+/*For FP scheduling strategies, go through the priority queues and
+ * and move out the task not eligible for current criticality.*/
+void clear_fp_ready_heap(struct fp_prio_queue* fpqueue, struct bheap* release_bin, bheap_check_t compare, bheap_prio_t higher_prio){
+   int i;
+   int var;
+   int prio;
+
+  for(i=0; i< FP_PRIO_BIT_WORDS; i++){
+    if(fpqueue->bitmask[i])
+        var  = fpqueue->bitmask[i];
+        prio = 0;
+
+        if(var){
+            prio = __ffs(var) + i * BITS_PER_LONG;
+            bheap_iterate_clear(compare, higher_prio, &fpqueue->queue[prio], release_bin);
+            fpq_clear(fpqueue, i);
+        }
+  } 
+}
+

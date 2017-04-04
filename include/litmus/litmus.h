@@ -13,6 +13,8 @@
 #ifdef CONFIG_RELEASE_MASTER
 extern atomic_t release_master_cpu;
 #endif
+/*Save the current system criticality*/
+extern int current_criticality;
 
 /* in_list - is a given list_head queued on some list?
  */
@@ -49,6 +51,9 @@ void litmus_dealloc(struct task_struct *tsk);
 void litmus_do_exit(struct task_struct *tsk);
 int litmus_be_migrate_to(int cpu);
 
+/*EDF-VD: Function to raise critiality.
+*/
+int raise_system_criticality(void);
 #define is_realtime(t) 		((t)->policy == SCHED_LITMUS)
 #define rt_transition_pending(t) \
 	((t)->rt_param.transition_pending)
@@ -64,16 +69,28 @@ int litmus_be_migrate_to(int cpu);
 #define get_boost_start(t)      0
 #endif
 
+/* task_params macros 
+*  Modified to support the MC parameters.
+*/
+#define get_exec_cost(t)    (tsk_rt(t)->task_params.mc_param.budget[current_criticality - 1])
+#define get_rt_period(t)    (tsk_rt(t)->task_params.mc_param.period[current_criticality - 1])
+#define get_rt_relative_deadline(t) (tsk_rt(t)->task_params.mc_param.deadline[current_criticality - 1])
 
-/* task_params macros */
-#define get_exec_cost(t)  	(tsk_rt(t)->task_params.exec_cost)
-#define get_rt_period(t)	(tsk_rt(t)->task_params.period)
-#define get_rt_relative_deadline(t)	(tsk_rt(t)->task_params.relative_deadline)
+//#define get_exec_cost(t)  	(tsk_rt(t)->task_params.exec_cost)
+//#define get_rt_period(t)	(tsk_rt(t)->task_params.period)
+//#define get_rt_relative_deadline(t)	(tsk_rt(t)->task_params.relative_deadline)
+
 #define get_rt_phase(t)		(tsk_rt(t)->task_params.phase)
 #define get_partition(t) 	(tsk_rt(t)->task_params.cpu)
 #define get_priority(t) 	(tsk_rt(t)->task_params.priority)
 #define get_class(t)        (tsk_rt(t)->task_params.cls)
 #define get_release_policy(t) (tsk_rt(t)->task_params.release_policy)
+
+/*EDFVD: MC task macros*/
+#define is_task_eligible(t)        (tsk_rt(t)->task_params.mc_param.criticality >= current_criticality)
+#define set_budget_overrun(t)     (tsk_rt(t)->job_params.deadline_status = BUDGET_OVERRUN)
+#define clear_budget_overrun(t)   (tsk_rt(t)->job_params.deadline_status = BUDGET_SAFE)
+#define check_budget_overrun(t)     (tsk_rt(t)->job_params.deadline_status == BUDGET_OVERRUN)
 
 /* job_param macros */
 #define get_exec_time(t)    (tsk_rt(t)->job_params.exec_time)

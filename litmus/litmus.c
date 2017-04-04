@@ -33,7 +33,7 @@
 
 /* Number of RT tasks that exist in the system */
 atomic_t rt_task_count 		= ATOMIC_INIT(0);
-
+int current_criticality     = 0;
 #ifdef CONFIG_RELEASE_MASTER
 /* current master CPU for handling timer IRQs */
 atomic_t release_master_cpu = ATOMIC_INIT(NO_CPU);
@@ -41,6 +41,22 @@ atomic_t release_master_cpu = ATOMIC_INIT(NO_CPU);
 
 static struct kmem_cache * bheap_node_cache;
 extern struct kmem_cache * release_heap_cache;
+
+
+/*EDF-VD: Raise system criticality
+ * */
+int raise_system_criticality(void)
+{
+    int retval = 0;
+    if(current_criticality < MAX_CRITICALITY_LEVEL){
+        current_criticality += 1;
+    }
+    else{
+        retval = -EINVAL;
+ 
+    }
+    return retval;
+}
 
 struct bheap_node* bheap_node_alloc(int gfp_flags)
 {

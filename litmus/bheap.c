@@ -99,6 +99,67 @@ static  void __bheap_min(bheap_prio_t higher_prio, struct bheap* heap,
 	}
 }
 
+/*EDFVD: Iterate and clear an entire bheap data structure.
+ * */
+void bheap_iterate_delete(bheap_prio_t higher_prio,struct bheap* heap)
+{
+  struct bheap_node* cur, *next;
+  cur = heap->head;
+  if(!cur){
+      /*Gave an empty heap to delete
+       * */
+      return;
+  }
+  while(cur){
+      next = cur->next;
+      if(cur){
+          bheap_delete(higher_prio,heap,cur);
+          cur = next;
+      }
+  }  
+}
+
+
+/*EDFVD: Inserted as part of the requirement to interate and remove over the tree
+ * */
+void bheap_iterate_clear(bheap_check_t compare,bheap_prio_t higher_prio, struct bheap* heap, struct bheap* bin)
+{
+    struct bheap_node* cur, *next;
+    if(!heap->head){
+      //  *bin = NULL;
+        return;
+    }
+    cur = heap->head;
+    while(cur){
+        next = cur->next;
+        if(compare(cur)){
+            bheap_insert(higher_prio,bin,cur);
+            bheap_delete(higher_prio,heap,cur);
+        }
+        cur = next;
+    }
+}
+/*EDFVD: Inserted as part of the requirement to release back the task while recovering back from
+ * high criticality state
+ * */
+void bheap_iterate_add(bheap_check_t check,bheap_prio_t higher_prio, struct bheap* heap, struct bheap* bin)
+{
+    struct bheap_node* cur, *next;
+    if(!(bin->head)){
+        /*Scenario with a gap in criticality*/
+        return;
+    }
+    cur = bin->head;
+    while(cur){
+        next = cur->next;
+        if(check(cur)){
+            bheap_insert(higher_prio,heap,cur);
+            bheap_delete(higher_prio,bin,cur);
+        }
+        cur = next;
+    }
+}
+
 static  void __bheap_union(bheap_prio_t higher_prio, struct bheap* heap,
 				struct bheap_node* h2)
 {
@@ -209,7 +270,7 @@ struct bheap_node* bheap_peek(bheap_prio_t higher_prio,
 struct bheap_node* bheap_take(bheap_prio_t higher_prio,
 			    struct bheap* heap)
 {
-	struct bheap_node *node;
+	struct bheap_node *node = NULL;/*EDFVD: Initialization done*/
 	if (!heap->min)
 		heap->min = __bheap_extract_min(higher_prio, heap);
 	node = heap->min;

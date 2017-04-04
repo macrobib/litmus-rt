@@ -27,6 +27,7 @@ struct bheap {
 };
 
 typedef int (*bheap_prio_t)(struct bheap_node* a, struct bheap_node* b);
+typedef int (*bheap_check_t)(struct bheap_node* a);
 
 void bheap_init(struct bheap* heap);
 void bheap_node_init(struct bheap_node** ref_to_bheap_node_ptr, void* value);
@@ -74,4 +75,9 @@ int bheap_add(bheap_prio_t higher_prio, struct bheap* heap,
 
 void* bheap_take_del(bheap_prio_t higher_prio,
 		    struct bheap* heap);
+void bheap_iterate_delete(bheap_prio_t higher_prio,struct bheap* heap);
+
+void bheap_iterate_clear(bheap_check_t compare,bheap_prio_t higher_prio, struct bheap* heap, struct bheap* bin);
+
+void bheap_iterate_add(bheap_check_t check,bheap_prio_t higher_prio, struct bheap* heap, struct bheap* bin);
 #endif

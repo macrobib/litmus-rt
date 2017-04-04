@@ -4,7 +4,7 @@
  */
 #ifndef _LINUX_RT_PARAM_H_
 #define _LINUX_RT_PARAM_H_
-
+#include <litmus/mc_param.h>
 /* Litmus time type. */
 typedef unsigned long long lt_t;
 
@@ -122,6 +122,7 @@ struct rt_task {
 	task_class_t	cls;
 	budget_policy_t  budget_policy;  /* ignored by pfair */
 	release_policy_t release_policy;
+    struct mc_task mc_param;
 };
 
 /* don't export internal data structures to user space (liblitmus) */
@@ -130,6 +131,13 @@ struct rt_task {
 struct _rt_domain;
 struct bheap_node;
 struct release_heap;
+
+typedef enum{
+    DEADLINE_SAFE,
+    DEADLINE_FAILED,
+    BUDGET_SAFE,
+    BUDGET_OVERRUN
+}deadline_status_t;
 
 struct rt_job {
 	/* Time instant the the job was or will be released.  */
