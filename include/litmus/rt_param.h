@@ -163,7 +163,8 @@ struct rt_job {
 	 * Increase this sequence number when a job is released.
 	 */
 	unsigned int    job_no;
-
+    
+    deadline_status_t deadline_status;
 #ifdef CONFIG_SCHED_TASK_TRACE
 	/* Keep track of the last time the job suspended.
 	 * -> used for tracing sporadic tasks. */
