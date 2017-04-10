@@ -8,7 +8,6 @@ struct mc_task{
     unsigned long long period[MAX_CRITICALITY_LEVEL];
     unsigned long long budget[MAX_CRITICALITY_LEVEL];
     unsigned long long deadline[MAX_CRITICALITY_LEVEL];
-    unsigned int FNR;
 };
 
 

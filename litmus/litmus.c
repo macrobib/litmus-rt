@@ -34,6 +34,7 @@
 /* Number of RT tasks that exist in the system */
 atomic_t rt_task_count 		= ATOMIC_INIT(0);
 int current_criticality     = 0;
+int mc_enabled = 0;
 #ifdef CONFIG_RELEASE_MASTER
 /* current master CPU for handling timer IRQs */
 atomic_t release_master_cpu = ATOMIC_INIT(NO_CPU);
@@ -42,20 +43,56 @@ atomic_t release_master_cpu = ATOMIC_INIT(NO_CPU);
 static struct kmem_cache * bheap_node_cache;
 extern struct kmem_cache * release_heap_cache;
 
-
-/*EDF-VD: Raise system criticality
- * */
-int raise_system_criticality(void)
-{
-    int retval = 0;
-    if(current_criticality < MAX_CRITICALITY_LEVEL){
-        current_criticality += 1;
+/*EDF-VD: Set MC plugin status.*/
+void set_mc_status(const char* plugin_name){
+    if(!strcmp(plugin_name, "MIXCRIT")){
+        mc_enabled = 1;
+    }
+    else if(!strcmp(plugin_name, "EDFVD")){
+        mc_enabled = 1;
+    }
+    else if(!strcmp(plugin_name, "AMC")){
+        mc_enabled  = 1;
     }
     else{
-        retval = -EINVAL;
- 
+        mc_enabled = 0;
     }
-    return retval;
+}
+
+/*EDF-VD: Wrapper accessor for period.*/
+int _get_rt_period(struct task_struct* t){
+ int period = -EINVAL;
+ if(mc_enabled){
+     period = get_mc_rt_period(t);     
+ }
+ else{
+     period = get_rt_period(t);
+ }
+ return period;
+}
+
+/*Wrapper accessor for wcet.*/
+int _get_exec_cost(struct task_struct* t){
+    int cost = -EINVAL;
+    if(mc_enabled){
+        cost = get_mc_exec_cost(t);
+    }
+    else{
+        cost = get_exec_cost(t);
+    }
+    return cost;
+}
+
+/*Wrapper accessor for deadline.*/
+int _get_rt_relative_deadline(struct task_struct* t){
+    int rel_deadline = -EINVAL;
+    if(mc_enabled){
+        rel_deadline = get_mc_relative_deadline(t);
+    }
+    else{
+        rel_deadline = get_rt_relative_deadline(t);
+    }
+    return rel_deadline;
 }
 
 struct bheap_node* bheap_node_alloc(int gfp_flags)
@@ -116,12 +153,14 @@ asmlinkage long sys_set_rt_task_param(pid_t pid, struct rt_task __user * param)
 	struct task_struct *target;
 	int retval = -EINVAL;
 
-	printk("Setting up rt task parameters for process %d.\n", pid);
+	printk(KERN_ERR"Litmus:- Setting up rt task parameters for process %d.\n", pid);
 
 	if (pid < 0 || param == 0) {
+        printk(KERN_ERR"Param failed: param: %d \n", pid);
 		goto out;
 	}
 	if (copy_from_user(&tp, param, sizeof(tp))) {
+        printk(KERN_ERR"copy from user failed..\n");
 		retval = -EFAULT;
 		goto out;
 	}
@@ -130,6 +169,7 @@ asmlinkage long sys_set_rt_task_param(pid_t pid, struct rt_task __user * param)
 	read_lock_irq(&tasklist_lock);
 	rcu_read_lock();
 	if (!(target = find_task_by_vpid(pid))) {
+        printk(KERN_ERR"target by vpid failed..\n");
 		retval = -ESRCH;
 		rcu_read_unlock();
 		goto out_unlock;
@@ -140,13 +180,17 @@ asmlinkage long sys_set_rt_task_param(pid_t pid, struct rt_task __user * param)
 	if (tp.relative_deadline == 0)
 		tp.relative_deadline = tp.period;
 
-	if (tp.exec_cost <= 0)
+	if (tp.exec_cost <= 0){
+        printk(KERN_ERR"execution cost less than zero..\n");
 		goto out_unlock;
-	if (tp.period <= 0)
-		goto out_unlock;
+    }
+	if (tp.period <= 0){
+		printk(KERN_ERR"Period less than zero..\n");
+        goto out_unlock;
+    }
 	if (min(tp.relative_deadline, tp.period) < tp.exec_cost) /*density check*/
 	{
-		printk(KERN_INFO "litmus: real-time task %d rejected "
+		printk(KERN_ERR "litmus: real-time task %d rejected "
 		       "because task density > 1.0\n", pid);
 		goto out_unlock;
 	}
@@ -154,7 +198,7 @@ asmlinkage long sys_set_rt_task_param(pid_t pid, struct rt_task __user * param)
 	    tp.cls != RT_CLASS_SOFT &&
 	    tp.cls != RT_CLASS_BEST_EFFORT)
 	{
-		printk(KERN_INFO "litmus: real-time task %d rejected "
+		printk(KERN_ERR "litmus: real-time task %d rejected "
 				 "because its class is invalid\n", pid);
 		goto out_unlock;
 	}
@@ -162,18 +206,19 @@ asmlinkage long sys_set_rt_task_param(pid_t pid, struct rt_task __user * param)
 	    tp.budget_policy != QUANTUM_ENFORCEMENT &&
 	    tp.budget_policy != PRECISE_ENFORCEMENT)
 	{
-		printk(KERN_INFO "litmus: real-time task %d rejected "
+		printk(KERN_ERR "litmus: real-time task %d rejected "
 		       "because unsupported budget enforcement policy "
 		       "specified (%d)\n",
 		       pid, tp.budget_policy);
 		goto out_unlock;
 	}
-
+    printk(KERN_WARNING"Basic error check completed.\n");
 	if (is_realtime(target)) {
 		/* The task is already a real-time task.
 		 * Let plugin decide whether it wants to support
 		 * parameter changes at runtime.
 		 */
+        printk(KERN_DEBUG"Invoking task change params.\n");
 		retval = litmus->task_change_params(target, &tp);
 	} else {
 		target->rt_param.task_params = tp;
@@ -182,6 +227,7 @@ asmlinkage long sys_set_rt_task_param(pid_t pid, struct rt_task __user * param)
       out_unlock:
 	read_unlock_irq(&tasklist_lock);
       out:
+    printk(KERN_ERR"Return value: %d\n", retval);
 	return retval;
 }
 
@@ -415,6 +461,8 @@ long litmus_admit_task(struct task_struct* tsk)
 	if (get_rt_relative_deadline(tsk) == 0 ||
 	    get_exec_cost(tsk) >
 			min(get_rt_relative_deadline(tsk), get_rt_period(tsk)) ) {
+
+        printk(KERN_WARNING"Litmus:- Invalid Task Parameters.\n");
 		TRACE_TASK(tsk,
 			"litmus admit: invalid task parameters "
 			"(e = %lu, p = %lu, d = %lu)\n",
@@ -487,7 +535,7 @@ static int __do_plugin_switch(struct sched_plugin* plugin)
 			       plugin->plugin_name, ret);
 			plugin = &linux_sched_plugin;
 		}
-
+        set_mc_status(plugin->plugin_name);
 		printk(KERN_INFO "Switching to LITMUS^RT plugin %s.\n", plugin->plugin_name);
 		litmus = plugin;
 	} else

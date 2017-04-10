@@ -51,9 +51,9 @@ void litmus_dealloc(struct task_struct *tsk);
 void litmus_do_exit(struct task_struct *tsk);
 int litmus_be_migrate_to(int cpu);
 
-/*EDF-VD: Function to raise critiality.
-*/
-int raise_system_criticality(void);
+/*EDF-VD: Plugin status*/
+void set_mc_status(const char* plugin_name);
+
 #define is_realtime(t) 		((t)->policy == SCHED_LITMUS)
 #define rt_transition_pending(t) \
 	((t)->rt_param.transition_pending)
@@ -72,13 +72,13 @@ int raise_system_criticality(void);
 /* task_params macros 
 *  Modified to support the MC parameters.
 */
-#define get_exec_cost(t)    (tsk_rt(t)->task_params.mc_param.budget[current_criticality - 1])
-#define get_rt_period(t)    (tsk_rt(t)->task_params.mc_param.period[current_criticality - 1])
-#define get_rt_relative_deadline(t) (tsk_rt(t)->task_params.mc_param.deadline[current_criticality - 1])
+#define get_mc_exec_cost(t)    (tsk_rt(t)->task_params.mc_param.budget[current_criticality])
+#define get_mc_rt_period(t)    (tsk_rt(t)->task_params.mc_param.period[current_criticality])
+#define get_mc_relative_deadline(t) (tsk_rt(t)->task_params.mc_param.deadline[current_criticality])
 
-//#define get_exec_cost(t)  	(tsk_rt(t)->task_params.exec_cost)
-//#define get_rt_period(t)	(tsk_rt(t)->task_params.period)
-//#define get_rt_relative_deadline(t)	(tsk_rt(t)->task_params.relative_deadline)
+#define get_exec_cost(t)  	(tsk_rt(t)->task_params.exec_cost)
+#define get_rt_period(t)	(tsk_rt(t)->task_params.period)
+#define get_rt_relative_deadline(t)	(tsk_rt(t)->task_params.relative_deadline)
 
 #define get_rt_phase(t)		(tsk_rt(t)->task_params.phase)
 #define get_partition(t) 	(tsk_rt(t)->task_params.cpu)

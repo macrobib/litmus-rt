@@ -84,9 +84,8 @@ void __add_release(rt_domain_t* rt, struct task_struct *task);
 
 /*EDFVD: Function to handle movement of task in and out of release queue during criticality change.
  * */
-void update_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_prio_t higher_prio,int use_task_heap);
-void clear_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_check_t compare,bheap_prio_t higher_prio);
-void replenish_task_for_mode(struct task_struct* t);
+extern void update_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_prio_t higher_prio,int use_task_heap);
+extern void clear_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_check_t compare,bheap_prio_t higher_prio);
 
 static inline struct task_struct* __take_ready(rt_domain_t* rt)
 {
@@ -149,11 +148,15 @@ static inline struct task_struct* take_ready(rt_domain_t* rt)
 static inline void add_release(rt_domain_t* rt, struct task_struct *task)
 {
 	unsigned long flags;
+#ifdef CONFIG_ENABLE_MC_SUPPORT
     if(is_task_eligible(task)){
+#endif
 	    raw_spin_lock_irqsave(&rt->tobe_lock, flags);
     	__add_release(rt, task);
 	    raw_spin_unlock_irqrestore(&rt->tobe_lock, flags);
+#ifdef CONFIG_ENABLE_MC_SUPPORT
     }
+#endif
 }
 
 #ifdef CONFIG_RELEASE_MASTER

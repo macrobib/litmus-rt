@@ -361,6 +361,7 @@ void update_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_prio_t 
   struct task_struct* t = NULL;
   lt_t release_time;
   struct bheap_node* node = NULL;
+  int delta = 0, current_time = 0;
 
 /*EDFVD: step1: retrieve the min prio task from release bin.
 */
@@ -372,39 +373,18 @@ void update_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_prio_t 
         /*While arming the timer the time should be in future
          * to avoid stale tasks being left in the release queue.
          * */
-         release_time = litmus_clock() + get_rt_period(t);
+         current_time = litmus_clock();
+         delta = current_time % get_rt_period(t);
+         release_time = (current_time - delta) + get_rt_period(t);
          slot = time2slot(release_time);
     }
     else{
          slot = time2slot(release_time);
     }
     /*EDFVD: step2 :Find the time slot for release and Insert to the appropriate slot*/
-    pos = rt->release_queue.slot[slot].next;
-    list_for_each(pos,&rt->release_queue.slot[slot]){
-      rh = list_entry(pos,struct release_heap,list);
-      if(heap->release_time == release_time){
-          heap = rh;
-          bheap_insert(higher_prio, &rh->heap, tsk_rt(t)->heap_node);
-          break;
-      }
-      else if (lt_before(release_time, rh->release_time)){
-          break;
-      }
-    }
-   /**EDFVD: step3: In case of no appropriate heap entry for release time assign one.
-  */
-    if (!heap && use_task_heap) {
-      /* use pre-allocated release heap */
-        rh = tsk_rt(t)->rel_heap;
-        rh->dom = rt;
-        rh->release_time = release_time;
-        /* add to release queue */
-      list_add(&rh->list, pos->prev);
-      heap = rh;
-   }
+    add_release(rt, t);
   node = bheap_take(higher_prio,release_bin);
  }
-  arm_release_timer(rt);
 }
 
 /*EDFVD: Clear out the tasks from release heap based on the 
@@ -430,21 +410,6 @@ void clear_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_check_t 
           bheap_iterate_clear(compare,higher_prio,&rh->heap,release_bin);
       }
   }
-
-}
-
-/*If the task is eligible to run in the current criticality update
- * the period value accordingly*/
-void replenish_task_for_mode(struct task_struct* t){
-     
-    int deadline_surplus = 0;
-    if(current_criticality >= 2){
-        int x1 = tsk_rt(t)->task_params.mc_param.deadline[current_criticality - 1];
-        int x2 = tsk_rt(t)->task_params.mc_param.deadline[current_criticality - 2];
-
-        deadline_surplus = x1 - x2;
-    }
-    tsk_rt(t)->job_params.deadline += deadline_surplus;
 }
 
 /*For FP scheduling strategies, go through the priority queues and

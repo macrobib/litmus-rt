@@ -147,7 +147,7 @@ static long litmus_ctrl_ioctl(struct file *filp,
 	 */
 
 	union litmus_syscall_args syscall_args;
-
+    printk(KERN_INFO"Litmus: ioctl call invoked -- %d\n", cmd);
 	switch (cmd) {
 	case LRT_set_rt_task_param:
 	case LRT_get_rt_task_param:

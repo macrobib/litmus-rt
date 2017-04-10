@@ -407,7 +407,7 @@ static long do_pres_reservation_create(
 	struct reservation* new_res = NULL;
 	unsigned long flags;
 	long err;
-
+    printk(KERN_ERR"Litmus: Create reservation.\n");
 	/* Allocate before we grab a spin lock. */
 	switch (res_type) {
 		case PERIODIC_POLLING:

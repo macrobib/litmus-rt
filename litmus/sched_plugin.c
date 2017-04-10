@@ -165,6 +165,7 @@ static long  litmus_dummy_reservation_create(
 	int reservation_type,
 	void* __user config)
 {
+    printk(KERN_ERR"Dummy litmus plugin called..\n");
 	return -ENOSYS;
 }
 
