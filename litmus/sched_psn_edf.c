@@ -243,7 +243,7 @@ static struct task_struct* psnedf_schedule(struct task_struct * prev)
 	if (next) {
 		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
 	} else {
-		TRACE("becoming idle at %llu\n", litmus_clock());
+//      TRACE("becoming idle at %llu\n", litmus_clock());
 	}
 
 	pedf->scheduled = next;

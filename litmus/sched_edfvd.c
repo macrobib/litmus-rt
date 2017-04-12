@@ -79,7 +79,7 @@ static void lower_system_criticality(void){
         update_release_heap(edfvd, release_bin, edf_ready_order, 1);
     }
     else{
-        TRACE("Bug: Tried to lower criticality below 0.\n");
+       // TRACE("Bug: Tried to lower criticality below 0.\n");
     }
 }
 
@@ -262,7 +262,6 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 	int 			out_of_time, sleep, preempt,
 				np, exists, blocks, resched;
     
-    printk(KERN_WARNING"edfvd scheduler invoked..\n");
 	raw_spin_lock(&edfvd->slock);
 	/* sanity checking
 	 * differently from gedf, when a task exits (dead)
@@ -306,8 +305,11 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
     /*Handle a task that was pushed to ready queue before a criticality 
      * change. Rather than moving all release queue, skip when the task is
      * scheduled and move it low crit heap.*/
-    if(!is_task_eligible(prev)){
+    while(!is_task_eligible(prev) && (prev != NULL)){
         add_low_crit_to_wait_queue(prev);
+        prev = __take_ready(edf);
+        exists = 1;
+        resched = 0;
     }
 
 	/* If a task blocks we have no choice but to reschedule.
@@ -361,7 +363,7 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 	} else {
         /*Idle instance encoutered, force a low task to be run as 
          * background, or lower the criticality.*/
-		TRACE("becoming idle and lowering criticality at: %llu\n", litmus_clock());
+        //TRACE("becoming idle and lowering criticality at: %llu\n", litmus_clock());
         lower_system_criticality();
 	}
 	edfvd->scheduled = next;
