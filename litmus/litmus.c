@@ -34,6 +34,7 @@
 /* Number of RT tasks that exist in the system */
 atomic_t rt_task_count 		= ATOMIC_INIT(0);
 int current_criticality     = 0;
+int system_criticality = 0;  
 int mc_enabled = 0;
 #ifdef CONFIG_RELEASE_MASTER
 /* current master CPU for handling timer IRQs */
@@ -60,37 +61,37 @@ void set_mc_status(const char* plugin_name){
 }
 
 /*EDF-VD: Wrapper accessor for period.*/
-int _get_rt_period(struct task_struct* t){
- int period = -EINVAL;
+lt_t get_rt_period(struct task_struct* t){
+ lt_t period = -EINVAL;
  if(mc_enabled){
      period = get_mc_rt_period(t);     
  }
  else{
-     period = get_rt_period(t);
+     period = _get_rt_period(t);
  }
  return period;
 }
 
 /*Wrapper accessor for wcet.*/
-int _get_exec_cost(struct task_struct* t){
-    int cost = -EINVAL;
+lt_t get_exec_cost(struct task_struct* t){
+    lt_t cost = -EINVAL;
     if(mc_enabled){
         cost = get_mc_exec_cost(t);
     }
     else{
-        cost = get_exec_cost(t);
+        cost = _get_exec_cost(t);
     }
     return cost;
 }
 
 /*Wrapper accessor for deadline.*/
-int _get_rt_relative_deadline(struct task_struct* t){
-    int rel_deadline = -EINVAL;
+lt_t get_rt_relative_deadline(struct task_struct* t){
+    lt_t rel_deadline = -EINVAL;
     if(mc_enabled){
         rel_deadline = get_mc_relative_deadline(t);
     }
     else{
-        rel_deadline = get_rt_relative_deadline(t);
+        rel_deadline = _get_rt_relative_deadline(t);
     }
     return rel_deadline;
 }
@@ -388,6 +389,12 @@ asmlinkage long sys_reservation_destroy(unsigned int reservation_id, int cpu)
 	return litmus->reservation_destroy(reservation_id, cpu);
 }
 
+asmlinkage long sys_set_system_criticality(lt_t __user crit){
+    long ret = 0;
+    system_criticality = crit;
+    return ret;
+} 
+
 /* p is a real-time task. Re-init its state as a best-effort task. */
 static void reinit_litmus_state(struct task_struct* p, int restore)
 {
@@ -579,7 +586,7 @@ int switch_sched_plugin(struct sched_plugin* plugin)
 {
 	int err;
 	struct domain_proc_info* domain_info;
-
+    printk(KERN_WARNING"Switching active plugin..\n");
 	BUG_ON(!plugin);
 
 	if (atomic_read(&rt_task_count) == 0) {

@@ -262,6 +262,7 @@ struct sched_plugin* find_sched_plugin(const char* name)
 	struct list_head *pos;
 	struct sched_plugin *plugin;
 
+    printk(KERN_ERR"Find scheduler plugin.\n");
 	raw_spin_lock(&sched_plugins_lock);
 	list_for_each(pos, &sched_plugins) {
 		plugin = list_entry(pos, struct sched_plugin, list);

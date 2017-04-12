@@ -133,6 +133,7 @@ asmlinkage long sys_litmus_unlock(int lock_od);
 asmlinkage long sys_wait_for_job_release(unsigned int job);
 asmlinkage long sys_wait_for_ts_release(void);
 asmlinkage long sys_release_ts(lt_t __user *__delay);
+asmlinkage long sys_set_system_criticality(lt_t __user crit);
 
 static long litmus_ctrl_ioctl(struct file *filp,
 	unsigned int cmd, unsigned long arg)
@@ -184,6 +185,8 @@ static long litmus_ctrl_ioctl(struct file *filp,
 				syscall_args.od_open.obj_type,
 				syscall_args.od_open.obj_id,
 				syscall_args.od_open.config);
+        case LRT_set_system_criticality:
+            return sys_set_system_criticality(syscall_args.sys_crit);
 		}
 
 

@@ -9,7 +9,7 @@
 
 #include <litmus/litmus.h>
 #include <litmus/litmus_proc.h>
-
+#include <linux/delay.h>
 #include <litmus/clustered.h>
 
 /* in litmus/litmus.c */
@@ -84,9 +84,9 @@ static ssize_t litmus_active_proc_write(struct file *file,
 	char name[65];
 	struct sched_plugin* found;
 	ssize_t ret = -EINVAL;
-	int err;
+	int err, i;
 
-
+    printk(KERN_ERR"Pick an active plugin..\n");
 	ret = copy_and_chomp(name, sizeof(name), buffer, count);
 	if (ret < 0)
 		return ret;
@@ -94,13 +94,14 @@ static ssize_t litmus_active_proc_write(struct file *file,
 	found = find_sched_plugin(name);
 
 	if (found) {
+        printk(KERN_ERR"Found scheduler plugin, switch.\n");
 		err = switch_sched_plugin(found);
 		if (err) {
-			printk(KERN_INFO "Could not switch plugin: %d\n", err);
+			printk(KERN_ERR "Could not switch plugin: %d\n", err);
 			ret = err;
 		}
 	} else {
-		printk(KERN_INFO "Plugin '%s' is unknown.\n", name);
+		printk(KERN_ERR "Plugin '%s' is unknown.\n", name);
 		ret = -ESRCH;
 	}
 

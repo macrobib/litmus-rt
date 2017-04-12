@@ -61,7 +61,7 @@ static void edfvd_domain_init(edfvd_domain_t* edfvd,
 }
 
 static void raise_system_criticality(void){
-    if(current_criticality+ 1 < MAX_CRITICALITY_LEVEL){
+    if(current_criticality + 1 < system_criticality){
         current_criticality += 1;
     }
     else{
@@ -261,9 +261,9 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 
 	int 			out_of_time, sleep, preempt,
 				np, exists, blocks, resched;
-
+    
+    printk(KERN_WARNING"edfvd scheduler invoked..\n");
 	raw_spin_lock(&edfvd->slock);
-
 	/* sanity checking
 	 * differently from gedf, when a task exits (dead)
 	 * edfvd->schedule may be null and prev _is_ realtime
@@ -297,7 +297,8 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
             replenish_task_for_mode(prev, eRAISE_CRIT);
         }
         else{
-            add_low_crit_to_wait_queue(prev);
+            if(prev)
+                add_low_crit_to_wait_queue(prev);
             resched = 1; /*Force to pick a new task.*/
         }
     }
@@ -319,7 +320,7 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 	 */
 	if (np && (out_of_time || preempt || sleep))
 		request_exit_np(edfvd->scheduled);
-
+    
 	/* Any task that is preemptable and either exhausts its execution
 	 * budget or wants to sleep completes. We may have to reschedule after
 	 * this.
@@ -328,7 +329,6 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 		job_completion(edfvd->scheduled, !sleep);
 		resched = 1;
 	}
-
 	/* The final scheduling decision. Do we need to switch for some reason?
 	 * Switch if we are in RT mode and have no task or if we need to
 	 * resched.
@@ -345,7 +345,8 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 			    requeue(edfvd->scheduled, edf);
         }
         else{
-
+            if(edfvd->scheduled)
+                add_low_crit_to_wait_queue(edfvd->scheduled);
         }
 		next = __take_ready(edf);
 	} else
@@ -363,11 +364,9 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 		TRACE("becoming idle and lowering criticality at: %llu\n", litmus_clock());
         lower_system_criticality();
 	}
-
 	edfvd->scheduled = next;
 	sched_state_task_picked();
 	raw_spin_unlock(&edfvd->slock);
-
 	return next;
 }
 

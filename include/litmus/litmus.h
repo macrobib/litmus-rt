@@ -15,7 +15,7 @@ extern atomic_t release_master_cpu;
 #endif
 /*Save the current system criticality*/
 extern int current_criticality;
-
+extern int system_criticality; /*Max supported criticality in system.*/
 /* in_list - is a given list_head queued on some list?
  */
 static inline int in_list(struct list_head* list)
@@ -76,9 +76,9 @@ void set_mc_status(const char* plugin_name);
 #define get_mc_rt_period(t)    (tsk_rt(t)->task_params.mc_param.period[current_criticality])
 #define get_mc_relative_deadline(t) (tsk_rt(t)->task_params.mc_param.deadline[current_criticality])
 
-#define get_exec_cost(t)  	(tsk_rt(t)->task_params.exec_cost)
-#define get_rt_period(t)	(tsk_rt(t)->task_params.period)
-#define get_rt_relative_deadline(t)	(tsk_rt(t)->task_params.relative_deadline)
+#define _get_exec_cost(t)  	(tsk_rt(t)->task_params.exec_cost)
+#define _get_rt_period(t)	(tsk_rt(t)->task_params.period)
+#define _get_rt_relative_deadline(t)	(tsk_rt(t)->task_params.relative_deadline)
 
 #define get_rt_phase(t)		(tsk_rt(t)->task_params.phase)
 #define get_partition(t) 	(tsk_rt(t)->task_params.cpu)
@@ -87,7 +87,11 @@ void set_mc_status(const char* plugin_name);
 #define get_release_policy(t) (tsk_rt(t)->task_params.release_policy)
 
 /*EDFVD: MC task macros*/
-#define is_task_eligible(t)        (tsk_rt(t)->task_params.mc_param.criticality >= current_criticality)
+lt_t get_exec_cost(struct task_struct* t);
+lt_t get_rt_period(struct task_struct* t);
+lt_t get_rt_relative_deadline(struct task_struct* t);
+
+#define is_task_eligible(t)  ((t) == NULL ? 0 : (tsk_rt(t)->task_params.mc_param.criticality >= current_criticality))
 #define set_budget_overrun(t)     (tsk_rt(t)->job_params.deadline_status = BUDGET_OVERRUN)
 #define clear_budget_overrun(t)   (tsk_rt(t)->job_params.deadline_status = BUDGET_SAFE)
 #define check_budget_overrun(t)     (tsk_rt(t)->job_params.deadline_status == BUDGET_OVERRUN)

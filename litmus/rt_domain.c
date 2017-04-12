@@ -354,9 +354,6 @@ void __add_release(rt_domain_t* rt, struct task_struct *task)
  * */
 void update_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_prio_t higher_prio,int use_task_heap)
 {
-  struct list_head*    pos;
-  struct release_heap* heap = NULL;
-  struct release_heap* rh;
   unsigned int slot;
   struct task_struct* t = NULL;
   lt_t release_time;

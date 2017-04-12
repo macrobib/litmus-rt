@@ -74,6 +74,7 @@ typedef enum {
 	LRT_wait_for_ts_release,
 	LRT_release_ts,
 	LRT_get_current_budget,
+    LRT_set_system_criticality,
 } litmus_syscall_id_t;
 
 union litmus_syscall_args {
@@ -98,6 +99,8 @@ union litmus_syscall_args {
 		lt_t __user *expended;
 		lt_t __user *remaining;
 	} get_current_budget;
+
+    lt_t sys_crit; /*Current system criticality.*/
 };
 
 
