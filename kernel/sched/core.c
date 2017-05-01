@@ -3518,9 +3518,11 @@ recheck:
 				policy != SCHED_FIFO && policy != SCHED_RR &&
 				policy != SCHED_NORMAL && policy != SCHED_BATCH &&
 				policy != SCHED_IDLE && policy != SCHED_LITMUS)
+        {
+            printk(KERN_WARNING"Litmus:- Invalid sched policy set.\n");
 			return -EINVAL;
+        }
 	}
-
 	if (attr->sched_flags & ~(SCHED_FLAG_RESET_ON_FORK))
 		return -EINVAL;
 
