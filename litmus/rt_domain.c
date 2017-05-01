@@ -360,6 +360,7 @@ void update_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_prio_t 
   struct bheap_node* node = NULL;
   int delta = 0, current_time = 0;
 
+printk(KERN_ERR"Move task back to low crit.\n");
 /*EDFVD: step1: retrieve the min prio task from release bin.
 */
   node = bheap_take(higher_prio,release_bin);

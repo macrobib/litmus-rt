@@ -47,6 +47,7 @@ typedef enum{
 edfvd_domain_t local_domain;
 
 /*EDFVD: storage for the tasks removed from criticality change.*/
+static struct bheap edfvd_ready_bin; 
 static struct bheap edfvd_release_bin[MAX_CRITICALITY_LEVEL];
 
 static void edfvd_domain_init(edfvd_domain_t* edfvd,
@@ -59,18 +60,14 @@ static void edfvd_domain_init(edfvd_domain_t* edfvd,
 	edfvd->scheduled		= NULL;
 }
 
-static int raise_system_criticality(void){
-    int status = 0;
-
+static void raise_system_criticality(void){
     if(current_criticality + 1 < system_criticality){
         current_criticality += 1;
-        status = 1;
         printk(KERN_WARNING"System criticality raised due to budget overrun.\n");
     }
     else{
         TRACE("Bug: Tried to increase criticality above max\n");
     }
-    return status;
 }
 
 static void lower_system_criticality(void){
@@ -109,10 +106,9 @@ static int raise_hypercall(void){
 }
 #endif
 
-int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
+void replenish_task_for_mode(struct task_struct* t, crit_action_t action){
     
     int x1 = 0, x2 = 0;
-    int status = 1;
     int budget_surplus = 0;
     int deadline_surplus = 0;
     int period_surplus = 0;
@@ -134,35 +130,32 @@ int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
             period_surplus = x1 - x2;
         }
         if(action == eRAISE_CRIT){
-            printk("Replenished budget by: %d\n", budget_surplus);
-          //  tsk_rt(t)->job_params.exec_time += (budget_surplus);
+            tsk_rt(t)->job_params.exec_time += (budget_surplus);
             tsk_rt(t)->job_params.deadline += (deadline_surplus);
             tsk_rt(t)->job_params.release += (period_surplus);
         }
         else if (action == eLOWER_CRIT){
-           // tsk_rt(t)->job_params.exec_time += (budget_surplus);
+            tsk_rt(t)->job_params.exec_time -= (budget_surplus);
             tsk_rt(t)->job_params.deadline -= (deadline_surplus);
             tsk_rt(t)->job_params.release -= (period_surplus);
         }
-       if(!budget_remaining(t)){
-           prepare_for_next_period(t);
-           status = 0;
-       }
+        if(tsk_rt(t)->job_params.exec_time <0){
+            tsk_rt(t)->job_params.exec_time = 0;
+            prepare_for_next_period(t);
+        }
     }
-    return status;
 }
 
 static void requeue(struct task_struct* t, rt_domain_t *edf)
 {
 	if (t->state != TASK_RUNNING)
 		TRACE_TASK(t, "requeue: !TASK_RUNNING\n");
+
 	tsk_rt(t)->completed = 0;
-	if (is_early_releasing(t) || is_released(t, litmus_clock())){
+	if (is_early_releasing(t) || is_released(t, litmus_clock()))
 		__add_ready(edf, t);
-    }
-	else{
+	else
 		add_release(edf, t); /* it has got to wait */
-    }
 }
 
 /* we assume the lock is being held */
@@ -261,15 +254,44 @@ static void job_completion(struct task_struct* t, int forced)
 	prepare_for_next_period(t);
 }
 
+/*Alpha: Duplicated implemenation from edf common.*/
+static int edfvd_preemption_needed(rt_domain_t* rt, struct task_struct *t)
+{
+	/* we need the read lock for edf_ready_queue */
+	/* no need to preempt if there is nothing pending */
+    struct task_struct* next_pending = NULL;
+	if (!__jobs_pending(rt))
+		return 0;
+	/* we need to reschedule if t doesn't exist */
+	if (!t)
+		return 1;
+
+	/* NOTE: We cannot check for non-preemptibility since we
+	 *       don't know what address space we're currently in.
+	 */
+
+	/* make sure to get non-rt stuff out of the way */
+    next_pending = __next_ready(rt);
+    /*If the next task in ready queue was released ahead, and is of low-crit,
+     * let current task continue.*/
+    if(is_task_eligible(next_pending)){
+	    return !is_realtime(t) || edf_higher_prio(__next_ready(rt), t);
+    }
+    else{
+        return 0;
+    }
+}
+
 static struct task_struct* edfvd_schedule(struct task_struct * prev)
 {
 	edfvd_domain_t* 	edfvd = &local_domain;
 	rt_domain_t*		edf  = &edfvd->domain;
 	struct task_struct*	next;
-    
+
 	int 			out_of_time, sleep, preempt,
 				np, exists, blocks, resched;
    
+    printk(KERN_WARNING"Scheduled invoked..\n"); 
 	raw_spin_lock(&edfvd->slock);
 	/* sanity checking
 	 * differently from gedf, when a task exits (dead)
@@ -277,7 +299,7 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 	 */
 	BUG_ON(edfvd->scheduled && edfvd->scheduled != prev);
 	BUG_ON(edfvd->scheduled && !is_realtime(prev));
-    
+
 	/* (0) Determine state */
 	exists      = edfvd->scheduled != NULL;
 	blocks      = exists && !is_current_running();
@@ -287,8 +309,6 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 	sleep	    = exists && is_completed(edfvd->scheduled);
 	preempt     = edf_preemption_needed(edf, prev);
 
-    if(exists && !budget_precisely_enforced(edfvd->scheduled))
-        BUG_ON(exists);
 	/* If we need to preempt do so.
 	 * The following checks set resched to 1 in case of special
 	 * circumstances.
@@ -296,60 +316,24 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 	resched = preempt;
 
     /*Enforcement timer fired, but task did not mark completion.*/
-    if(!np && (out_of_time ||sleep)){
-        /*Condition 1: - Handle budget overrun.*/
-        if(out_of_time){
-            BUG_ON(!exists);
-            /*Budget overrun occurred, raise system criticality.*/
-            /*Change criticality only for a high crit overrun.*/
-            if(is_task_high_crit(edfvd->scheduled)){
-                printk(KERN_WARNING"Budget Overrun occurred..\n");
-                if(raise_system_criticality()){
-
-                    /**Update task control page to notify user space
-                     * of the change in criticality.**/
-                    if(has_control_page(edfvd->scheduled)){
-                        struct control_page* cp  = get_control_page(edfvd->scheduled);
-                        cp->active_crit = current_criticality;
-                    }
-                    if(replenish_task_for_mode(edfvd->scheduled, eRAISE_CRIT)){
-                        resched = 0;
-                        exists = 1;
-                    }
-                    else{
-                         /*Handle condition when task in run queue for too
-                          * long and wakes with large time delta.*/
-                         resched = 1;
-                    }
-                }
-                else{
-                    /*System criticality ceiling reached, mark and reschedule.*/
-                    job_completion(edfvd->scheduled, !sleep);
-                    resched = 1;
-                }
-            }
-            else{
-                /*Overrun task is low crit, mark completed and recshedule.*/
-                printk(KERN_WARNING"Low crit budget overrun..\n");
+    if(out_of_time && !sleep){
+        /*Budget overrun occurred, raise system criticality.*/
+        printk(KERN_WARNING"Budget overrun detected..\n");
+        raise_system_criticality();
+        if(is_task_eligible(edfvd->scheduled)){
+            /**Current task is eligible to run.*/
+            resched = 0;
+            exists = 1;
+            blocks = 0;
+            replenish_task_for_mode(prev, eRAISE_CRIT);
+        }
+        else{
+            if(edfvd->scheduled){
                 job_completion(edfvd->scheduled, !sleep);
-                resched = 1;
-               }
-       }
-        /*Condition 2: Handle task completion.*/
-       else if(sleep){
-            job_completion(edfvd->scheduled, !sleep);
-		    resched = 1;
-       } 
-       else{
-           /*unlikely state.*/
-           printk(KERN_WARNING"Unlikely error state hit..\n");
-           BUG_ON(out_of_time && sleep);
-       }
-    }
-    else{
-        if(exists && !blocks){
-            printk(KERN_WARNING"Undefined scheduler state..\n");
-            BUG_ON(exists);
+                add_low_crit_to_wait_queue(edfvd->scheduled);
+            }
+            resched = 1; /*Force to pick a new task.*/
+            exists = 0; /*Current task queued, pick a new one.*/
         }
     }
     /*Handle a task that was pushed to ready queue before a criticality 
@@ -358,18 +342,25 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 
 	/* If a task blocks we have no choice but to reschedule.
 	 */
-	if (blocks){
+	if (blocks)
 		resched = 1;
-        printk(KERN_WARNING"Task in blocking state...\n");
-    }
+
 	/* Request a sys_exit_np() call if we would like to preempt but cannot.
 	 * Multiple calls to request_exit_np() don't hurt.
 	 */
-	if (np && (out_of_time || preempt || sleep)){
+	if (np && (out_of_time || preempt || sleep))
 		request_exit_np(edfvd->scheduled);
-        BUG_ON(1);
-        }
     
+	/* Any task that is preemptable and either exhausts its execution
+	 * budget or wants to sleep completes. We mayl have to reschedule after
+	 * this.
+	 */
+	if (!np && (sleep)) {
+        if(!out_of_time)
+            printk(KERN_WARNING"Task completion received..\n");
+		job_completion(edfvd->scheduled, !sleep);
+		resched = 1;
+	}
 	/* The final scheduling decision. Do we need to switch for some reason?
 	 * Switch if we are in RT mode and have no task or if we need to
 	 * resched.
@@ -381,16 +372,15 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 		 * release queue (if it completed). requeue() picks
 		 * the appropriate queue.
 		 */
-        if(exists)
-        if (exists && !blocks){
+        if (exists){
             /*Handle scheduled task for preemption.*/
-            if(is_task_eligible(edfvd->scheduled)){
-                /*If completed task is eligible, then requeue, else store.*/
-			        requeue(edfvd->scheduled, edf);
-                }
-                else{
-                    add_low_crit_to_wait_queue(edfvd->scheduled);
-                }
+        if(is_task_eligible(edfvd->scheduled)){
+            /*If completed task is eligible, then requeue, else store.*/
+			    requeue(edfvd->scheduled, edf);
+            }
+            else{
+                add_low_crit_to_wait_queue(edfvd->scheduled);
+              }
             }
         /*Pick next ready task.*/
         prev = __take_ready(edf);
@@ -401,30 +391,21 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
         }
         next = prev;
 
-	} else{
-        /* Only override Linux scheduler if we have a real-time task
+	} else
+		/* Only override Linux scheduler if we have a real-time task
 		 * scheduled that needs to continue.
 		 */
-        printk(KERN_WARNING"Overriding criteria..\n");
 		if (exists)
 			next = prev;
-    }
 
 	if (next) {
 		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
 	} else {
         /*Idle instance encoutered, force a low task to be run as 
          * background, or lower the criticality.*/
-       // TRACE("becoming idle and lowering criticality at: %llu\n", litmus_clock());
-       // lower_system_criticality();
+        //TRACE("becoming idle and lowering criticality at: %llu\n", litmus_clock());
+        lower_system_criticality();
 	}
-   /** if(next){
-        printk(KERN_ERR"Budget Exiting..\n");
-        printk(KERN_ERR"Execution cost: %llu\n", get_exec_cost(next));
-        printk(KERN_ERR"Execution time: %llu\n", get_exec_time(next));
-        if(next == edfvd->scheduled)
-            BUG_ON(budget_exhausted(next));
-    }**/
 	edfvd->scheduled = next;
 	sched_state_task_picked();
 	raw_spin_unlock(&edfvd->slock);
@@ -443,7 +424,6 @@ static void edfvd_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 	TRACE_TASK(t, "psn edf: task new, cpu = %d\n",
 		   t->rt_param.task_params.cpu);
 
-    printk(KERN_WARNING"New task release..\n");
 	/* setup job parameters */
 	release_at(t, litmus_clock());
 
@@ -454,7 +434,6 @@ static void edfvd_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 	if (is_scheduled) {
 		/* there shouldn't be anything else scheduled at the time */
 		BUG_ON(edfvd->scheduled);
-        TRACE("New task scheduled..\n");
 		edfvd->scheduled = t;
 	} else {
 		/* !is_scheduled means it is not scheduled right now, but it
@@ -477,7 +456,7 @@ static void edfvd_task_wake_up(struct task_struct *task)
 	edfvd_domain_t* 	edfvd = &local_domain;
 	rt_domain_t* 		edf  = &local_domain.domain;
 	lt_t			now;
-    printk(KERN_WARNING"Wakeup the new task..\n");
+
 	TRACE_TASK(task, "wake_up at %llu\n", litmus_clock());
 	raw_spin_lock_irqsave(&edfvd->slock, flags);
 	BUG_ON(is_queued(task));
@@ -504,14 +483,8 @@ static void edfvd_task_wake_up(struct task_struct *task)
         /*If the waken task is not eligible on current crit, move to 
          * waiting release queue.
          * */
-        if(edfvd->scheduled == NULL)
-            printk(KERN_WARNING"No previous scheduled task..\n");
-        //release_at(task, litmus_clock());
-        printk(KERN_WARNING"Woken up task not same as current..: Requeued\n");
 		requeue(task, edf);
-		if(!edfvd_preempt_check(edfvd)){
-            printk(KERN_WARNING"No preemption done..\n");
-        }
+		edfvd_preempt_check(edfvd);
 	}
 
 	raw_spin_unlock_irqrestore(&edfvd->slock, flags);

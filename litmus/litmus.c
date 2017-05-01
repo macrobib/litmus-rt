@@ -21,7 +21,7 @@
 #include <litmus/rt_domain.h>
 #include <litmus/litmus_proc.h>
 #include <litmus/sched_trace.h>
-
+#include <litmus/budget.h>
 #ifdef CONFIG_SCHED_CPU_AFFINITY
 #include <litmus/affinity.h>
 #endif
@@ -36,6 +36,7 @@ atomic_t rt_task_count 		= ATOMIC_INIT(0);
 int current_criticality     = 0;
 int system_criticality = 0;  
 int mc_enabled = 0;
+int tolerance_limit = 0;
 #ifdef CONFIG_RELEASE_MASTER
 /* current master CPU for handling timer IRQs */
 atomic_t release_master_cpu = ATOMIC_INIT(NO_CPU);
@@ -58,6 +59,7 @@ void set_mc_status(const char* plugin_name){
     else{
         mc_enabled = 0;
     }
+    printk(KERN_WARNING"Litmus MC Status: %d\n", mc_enabled);
 }
 
 /*EDF-VD: Wrapper accessor for period.*/
@@ -67,6 +69,7 @@ lt_t get_rt_period(struct task_struct* t){
      period = get_mc_rt_period(t);     
  }
  else{
+     printk(KERN_WARNING"Period non MC.\n");
      period = _get_rt_period(t);
  }
  return period;
@@ -79,6 +82,7 @@ lt_t get_exec_cost(struct task_struct* t){
         cost = get_mc_exec_cost(t);
     }
     else{
+        printk(KERN_WARNING"Exec Cost non MC.\n");
         cost = _get_exec_cost(t);
     }
     return cost;
@@ -91,6 +95,7 @@ lt_t get_rt_relative_deadline(struct task_struct* t){
         rel_deadline = get_mc_relative_deadline(t);
     }
     else{
+        printk(KERN_WARNING"Relative deadline non MC.\n");
         rel_deadline = _get_rt_relative_deadline(t);
     }
     return rel_deadline;
@@ -153,6 +158,7 @@ asmlinkage long sys_set_rt_task_param(pid_t pid, struct rt_task __user * param)
 	struct rt_task tp;
 	struct task_struct *target;
 	int retval = -EINVAL;
+    int index = system_criticality;
 
 	printk(KERN_ERR"Litmus:- Setting up rt task parameters for process %d.\n", pid);
 
@@ -224,6 +230,13 @@ asmlinkage long sys_set_rt_task_param(pid_t pid, struct rt_task __user * param)
 	} else {
 		target->rt_param.task_params = tp;
 		retval = 0;
+        index = 0;
+        printk(KERN_WARNING"Task criticality is: %llu\n", tp.mc_param.criticality);
+        while(index <= tp.mc_param.criticality){
+            printk(KERN_WARNING"PID:%d - Crit:%d - Budget:%llu - Period:%llu - Deadline:%llu\n",
+                    pid, index, tp.mc_param.budget[index], tp.mc_param.period[index], tp.mc_param.deadline[index]);
+            ++index;
+        }
 	}
       out_unlock:
 	read_unlock_irq(&tasklist_lock);
@@ -293,6 +306,7 @@ asmlinkage long sys_complete_job(void)
 	/* The plugin has to put the task into an
 	 * appropriate queue and call schedule
 	 */
+    //deactivate_current_enforcement();
 	retval = litmus->complete_job();
       out:
 	return retval;
@@ -391,10 +405,15 @@ asmlinkage long sys_reservation_destroy(unsigned int reservation_id, int cpu)
 
 asmlinkage long sys_set_system_criticality(lt_t __user crit){
     long ret = 0;
+    printk(KERN_WARNING"System criticality set to: %d\n", crit);
     system_criticality = crit;
     return ret;
 } 
 
+/*Userspace interface to retrieve current criticality.*/
+asmlinkage sys_get_system_criticality(lt_t __user *crit){
+    return 0;
+}
 /* p is a real-time task. Re-init its state as a best-effort task. */
 static void reinit_litmus_state(struct task_struct* p, int restore)
 {

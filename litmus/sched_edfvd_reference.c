@@ -651,7 +651,7 @@ static void edfvd_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 
 	/* setup job params */
 	release_at(t, litmus_clock());
-	
+    printk(KERN_WARNING"New task released\n");	
     raw_spin_lock_irqsave(&edfvd_lock, flags);
 	if (is_scheduled) {
 		entry = &per_cpu(edfvd_cpu_entries, task_cpu(t));

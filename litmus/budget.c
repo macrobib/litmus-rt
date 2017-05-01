@@ -18,13 +18,13 @@ struct enforcement_timer {
 
 DEFINE_PER_CPU(struct enforcement_timer, budget_timer);
 
+
 static enum hrtimer_restart on_enforcement_timeout(struct hrtimer *timer)
 {
 	struct enforcement_timer* et = container_of(timer,
 						    struct enforcement_timer,
 						    timer);
 	unsigned long flags;
-
 	local_irq_save(flags);
 	TRACE("enforcement timer fired.\n");
 	et->armed = 0;
@@ -41,7 +41,6 @@ static void cancel_enforcement_timer(struct enforcement_timer* et)
 	int ret;
 
 	TRACE("cancelling enforcement timer.\n");
-
 	/* Since interrupts are disabled and et->armed is only
 	 * modified locally, we do not need any locks.
 	 */
@@ -101,6 +100,10 @@ void update_enforcement_timer(struct task_struct* t)
 	}
 }
 
+void deactivate_current_enforcement(void){
+	struct enforcement_timer* et = this_cpu_ptr(&budget_timer);
+    cancel_enforcement_timer(et);
+}
 
 static int __init init_budget_enforcement(void)
 {

@@ -44,7 +44,7 @@ struct control_page {
 	lt_t deadline; /* Deadline for the currently executing job */
 	lt_t release;  /* Release time of current job */
 	uint64_t job_index; /* Job sequence number of current job */
-
+    uint64_t active_crit; /*Active system criticality.*/
 	/* to be extended */
 };
 
@@ -75,6 +75,7 @@ typedef enum {
 	LRT_release_ts,
 	LRT_get_current_budget,
     LRT_set_system_criticality,
+    LRT_get_system_criticality
 } litmus_syscall_id_t;
 
 union litmus_syscall_args {

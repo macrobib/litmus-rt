@@ -153,6 +153,7 @@ static long litmus_ctrl_ioctl(struct file *filp,
 	case LRT_get_rt_task_param:
 	case LRT_reservation_create:
 	case LRT_get_current_budget:
+    case LRT_set_system_criticality:
 	case LRT_od_open:
 		/* multiple arguments => need to get args via pointer */
 		/* get syscall parameters */

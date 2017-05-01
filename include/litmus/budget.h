@@ -4,6 +4,7 @@
 /* Update the per-processor enforcement timer (arm/reproram/cancel) for
  * the next task. */
 void update_enforcement_timer(struct task_struct* t);
+void deactivate_current_enforcement(void);
 
 inline static int budget_exhausted(struct task_struct* t)
 {

@@ -92,6 +92,7 @@ lt_t get_rt_period(struct task_struct* t);
 lt_t get_rt_relative_deadline(struct task_struct* t);
 
 #define is_task_eligible(t)  ((t) == NULL ? 0 : (tsk_rt(t)->task_params.mc_param.criticality >= current_criticality))
+#define is_task_high_crit(t)  ((t) == NULL ? 0 : (tsk_rt(t)->task_params.mc_param.criticality >= (current_criticality + 1)))
 #define set_budget_overrun(t)     (tsk_rt(t)->job_params.deadline_status = BUDGET_OVERRUN)
 #define clear_budget_overrun(t)   (tsk_rt(t)->job_params.deadline_status = BUDGET_SAFE)
 #define check_budget_overrun(t)     (tsk_rt(t)->job_params.deadline_status == BUDGET_OVERRUN)

@@ -25,13 +25,20 @@ static inline void setup_release(struct task_struct *t, lt_t release)
 		cp->deadline = t->rt_param.job_params.deadline;
 		cp->release = get_release(t);
 		cp->job_index = t->rt_param.job_params.job_no;
+        cp->active_crit = current_criticality;
 	}
 }
 
 void prepare_for_next_period(struct task_struct *t)
 {
 	BUG_ON(!t);
-
+    /*Align the release time to period.
+     *Due to moving criticality using relative updates moves the
+     *alignment.
+     * */
+    lt_t release = get_release(t) + get_rt_period(t);
+    lt_t delta = release % get_rt_period(t);
+//    release -= delta;
 	/* Record lateness before we set up the next job's
 	 * release and deadline. Lateness may be negative.
 	 */
@@ -47,12 +54,13 @@ void prepare_for_next_period(struct task_struct *t)
 		tsk_rt(t)->sporadic_release = 0;
 	} else {
 		/* periodic release => add period */
-		setup_release(t, get_release(t) + get_rt_period(t));
+		setup_release(t, release);
 	}
 }
 
 void release_at(struct task_struct *t, lt_t start)
 {
+    printk(KERN_WARNING"Release at..\n");
 	BUG_ON(!t);
 	setup_release(t, start);
 	tsk_rt(t)->completed = 0;
