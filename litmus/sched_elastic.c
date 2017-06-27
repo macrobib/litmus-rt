@@ -1,832 +1,585 @@
 /*
- * litmus/sched_elastic.c
- *
- * Implementation of the MC under elastic supervison.
+ * kernel/sched_edfvd.c
  *
  */
 
-#include <linux/spinlock.h>
 #include <linux/percpu.h>
 #include <linux/sched.h>
-#include <linux/slab.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
+#include <linux/module.h>
 
 #include <litmus/litmus.h>
 #include <litmus/jobs.h>
+#include <litmus/preempt.h>
+#include <litmus/budget.h>
 #include <litmus/sched_plugin.h>
 #include <litmus/edf_common.h>
 #include <litmus/sched_trace.h>
 #include <litmus/trace.h>
 
-#include <litmus/preempt.h>
-#include <litmus/budget.h>
-
-#include <litmus/bheap.h>
-
-#ifdef CONFIG_SCHED_CPU_AFFINITY
-#include <litmus/affinity.h>
-#endif
-
 /* to set up domain/cpu mappings */
 #include <litmus/litmus_proc.h>
-
 #include <linux/module.h>
-
-/*EDFVD: added for hypercall invocation*/
+/*EDFVD: added for hypercall invocation.*/
+#ifdef ENABLE_MC_XEN
 #include <asm/xen/interface.h>
 #include <asm/xen/hypercall.h>
 #include <xen/hvc-console.h>
+#endif
 
-/* Overview
- *
- * link_task_to_cpu(T, cpu) 	- Low-level operation to update the linkage
- *                                structure (NOT the actually scheduled
- *                                task). If there is another linked task To
- *                                already it will set To->linked_on = NO_CPU
- *                                (thereby removing its association with this
- *                                CPU). However, it will not requeue the
- *                                previously linked task (if any). It will set
- *                                T's state to not completed and check whether
- *                                it is already running somewhere else. If T
- *                                is scheduled somewhere else it will link
- *                                it to that CPU instead (and pull the linked
- *                                task to cpu). T may be NULL.
- *
- * unlink(T)			- Unlink removes T from all scheduler data
- *                                structures. If it is linked to some CPU it
- *                                will link NULL to that CPU. If it is
- *                                currently queued in the elastic queue it will
- *                                be removed from the rt_domain. It is safe to
- *                                call unlink(T) if T is not linked. T may not
- *                                be NULL.
- *
- * requeue(T)			- Requeue will insert T into the appropriate
- *                                queue. If the system is in real-time mode and
- *                                the T is released already, it will go into the
- *                                ready queue. If the system is not in
- *                                real-time mode is T, then T will go into the
- *                                release queue. If T's release time is in the
- *                                future, it will go into the release
- *                                queue. That means that T's release time/job
- *                                no/etc. has to be updated before requeu(T) is
- *                                called. It is not safe to call requeue(T)
- *                                when T is already queued. T may not be NULL.
- *
- * elastic_job_arrival(T)	- This is the catch all function when T enters
- *                                the system after either a suspension or at a
- *                                job release. It will queue T (which means it
- *                                is not safe to call elastic_job_arrival(T) if
- *                                T is already queued) and then check whether a
- *                                preemption is necessary. If a preemption is
- *                                necessary it will update the linkage
- *                                accordingly and cause scheduled to be called
- *                                (either with an IPI or need_resched). It is
- *                                safe to call elastic_job_arrival(T) if T's
- *                                next job has not been actually released yet
- *                                (releast time in the future). T will be put
- *                                on the release queue in that case.
- *
- * job_completion(T)		- Take care of everything that needs to be done
- *                                to prepare T for its next release and place
- *                                it in the right queue with
- *                                elastic_job_arrival().
- *
- *
- * When we now that T is linked to CPU then link_task_to_cpu(NULL, CPU) is
- * equivalent to unlink(T). Note that if you unlink a task from a CPU none of
- * the functions will automatically propagate pending task from the ready queue
- * to a linked task. This is the job of the calling function ( by means of
- * __take_ready).
+/*Enforcement timer to maintain the slack expiration.*/
+struct enforcement_timer slack_timer;
+
+/*Structure representing a slack instance as a wrapper task.*/
+typedef struct slack{
+    int budget; /*Amount of slack available.*/
+    int period; /*Slack repetition instance*/
+    int state; /*Check if slack is being used or not.*/
+    struct task_struct* task; /*Task using the slack if use is set to active*/
+}slack_t;
+
+typedef struct {
+	rt_domain_t 		domain;
+	int          		cpu;
+	struct task_struct* 	scheduled; /* only RT tasks */
+/*
+ * scheduling lock slock
+ * protects the domain and serializes scheduling decisions
  */
+#define slock domain.ready_lock
+} edfvd_domain_t;
 
+typedef enum{
+    eLOWER_CRIT,
+    eRAISE_CRIT
+}crit_action_t;
+/*EDFVD Domain variable.*/
+edfvd_domain_t local_domain;
 
-/* cpu_entry_t - maintain the linked and scheduled state
- */
-typedef struct  {
-	int 			cpu;
-	struct task_struct*	linked;		/* only RT tasks */
-	struct task_struct*	scheduled;	/* only RT tasks */
-	struct bheap_node*	hn;
-} cpu_entry_t;
-DEFINE_PER_CPU(cpu_entry_t, elastic_cpu_entries);
+/*EDFVD: storage for the tasks removed from criticality change.*/
+static struct bheap edfvd_release_bin[MAX_CRITICALITY_LEVEL];
 
-cpu_entry_t* elastic_cpus[NR_CPUS];
-
-/* the cpus queue themselves according to priority in here */
-static struct bheap_node elastic_heap_node[NR_CPUS];
-static struct bheap      elastic_cpu_heap;
-
-/*EDFVD: storage for the tasks removed due to criticality change*/
-static struct bheap      elastic_ready_bin;
-static struct bheap      elastic_release_bin;
-static rt_domain_t elastic;
-#define elastic_lock (elastic.ready_lock)
-
-
-/* Uncomment this if you want to see all scheduling decisions in the
- * TRACE() log.
-#define WANT_ALL_SCHED_EVENTS
- */
-
-/*Functionality to feed criticality check in binary heap.
- * */
-static int elastic_check_criticality(struct bheap_node* node)
+static void edfvd_domain_init(edfvd_domain_t* edfvd,
+			       check_resched_needed_t check,
+			       release_jobs_t release,
+			       int cpu)
 {
-  struct task_struct* task = bheap2task(node);
-  return (is_task_eligible(task));
+	edf_domain_init(&edfvd->domain, check, release);
+	edfvd->cpu      		= cpu;
+	edfvd->scheduled		= NULL;
 }
 
-/*Functionality to reset the task parameters while moving down in criticality ladder
- * If the task been in elastic bin for too long paramters will be stale, update them. 
- * */
-static int elastic_reset_params(struct bheap_node* node)
-{
-    struct task_struct* task = bheap2task(node);
-    /*Release expired, make it to be released now.
-     * */
-    if(get_release(task) > litmus_clock()){
-        release_at(task,litmus_clock());
-    }
-   else{
-        TRACE("EDF-VD -- Criticality_Update: Task already set to release in future %d",current_criticality);
-   } 
-   return(elastic_check_criticality(node));
+/*Creates a slack timer for maintaining slack queues.*/
+static void elastic_init_slack_timer(void){
+
 }
 
+/*Calculate the default slack available in systems.*/
+static void elastic_calculate_init_slacks(){
 
-/*EDFVD: Update the global criticality level and raise hypercall 
- * to request removal of low priority domain at the 
- * hypervisor level.
- * */
-static int raise_hypercall(void)
-{
+}
+
+static int raise_system_criticality(void){
     int status = 0;
-    status = HYPERVISOR_sched_op(SCHEDOP_criticality,NULL);
+
+    if(current_criticality + 1 < system_criticality){
+        current_criticality += 1;
+        status = 1;
+        printk(KERN_WARNING"System criticality raised due to budget overrun.\n");
+    }
+    else{
+        TRACE("Bug: Tried to increase criticality above max\n");
+    }
+    return status;
+}
+
+static void lower_system_criticality(void){
+    struct bheap* release_bin;
+    rt_domain_t* edfvd = &local_domain.domain;
+
+    if(current_criticality > 0){
+        current_criticality -= 1;
+        release_bin = &edfvd_release_bin[current_criticality];
+        update_release_heap(edfvd, release_bin, edf_ready_order, 1);
+    }
+    else{
+       // TRACE("Bug: Tried to lower criticality below 0.\n");
+    }
+}
+
+static int edfvd_check_criticality(struct bheap_node* node){
+
+    struct task_struct* task = bheap2task(node);
+    return (is_task_eligible(task));
+}
+
+/*Add the low criticality task to appropriate release queue as 
+ * per the current criticality.*/
+static void add_low_crit_to_wait_queue(struct task_struct* t){
+    struct bheap* release_bin = &edfvd_release_bin[current_criticality - 1];
+    bheap_insert( edf_ready_order, release_bin, tsk_rt(t)->heap_node);
+}
+
+#ifdef MC_ENABLE_XEN
+static int raise_hypercall(void){
+    int status = 0;
+    status = HYPERVISOR_sched_op(SCHEDOP_criticality, NULL);
     barrier();
     return status;
 }
+#endif
 
-/*Task in the release queue shouldn't be thrown out, instead
- * should be stored for future release on criticality cooldown.
- * */
-static void update_release_queue(struct task_struct* t)
-{
-  /**bheap_iterate_clear(elastic_check_criticality,edf_ready_order,&elastic.release_queue,&elastic_release_bin); **/
-  update_release_heap(&elastic,&elastic_release_bin,edf_ready_order,1); 
-  TRACE("Release queue updated as per criticality increase: %d",current_criticality);
-}
-/*EDFVD: Clean up run queue and recalculate the budget if the task 
- * has high critical parameters as well.
- * */
-static int update_runqueue(struct task_struct* t)
-{
-    int status = -1;
-    bheap_iterate_clear(elastic_check_criticality,edf_ready_order,&elastic.ready_queue,&elastic_ready_bin);   
-    if(is_task_eligible(t)){
-        TRACE_TASK(t,"current task %d high crit: updated");
-	status = 0;
-    } 
-   return status;
-}
-
-/*
- * EDFVD: Check for criticality change and handle house keeping parameters.
- * */
-static int handle_criticality(struct task_struct* prev)
-{
-    int status = 0;
-    if(check_budget_overrun(prev)) {
-        if(!raise_system_criticality()){
-        raise_hypercall();
-        update_runqueue(prev);
-        update_release_queue(prev);
-        TRACE("Criticality raised to %d",current_criticality);
-        }
-        else
-        {
-        /*EDFVD: System already maxed out at criticality
-         *total system schedulability failure.
-         * */
-          TRACE_TASK(prev,"Scheduling failure: Criticality maxed out while handling task");  
-          status = -1;
-        } 
+int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
     
+    int x1 = 0, x2 = 0;
+    int status = 1;
+    int budget_surplus = 0;
+    int deadline_surplus = 0;
+    int period_surplus = 0;
+    
+    if(is_task_eligible(t)){
+        /* 
+         * replenishment task if eligible at current criticality.*/
+        if(current_criticality >= 1){
+            x1 = tsk_rt(t)->task_params.mc_param.budget[current_criticality];
+            x2 = tsk_rt(t)->task_params.mc_param.budget[current_criticality - 1];
+            budget_surplus = x1 - x2;
+
+            x1 = tsk_rt(t)->task_params.mc_param.deadline[current_criticality];
+            x2 = tsk_rt(t)->task_params.mc_param.deadline[current_criticality - 1];
+            deadline_surplus = x1 - x2;
+
+            x1 = tsk_rt(t)->task_params.mc_param.period[current_criticality];
+            x2 = tsk_rt(t)->task_params.mc_param.period[current_criticality - 1];
+            period_surplus = x1 - x2;
+        }
+        if(action == eRAISE_CRIT){
+            printk("Replenished budget by: %d\n", budget_surplus);
+          //  tsk_rt(t)->job_params.exec_time += (budget_surplus);
+            tsk_rt(t)->job_params.deadline += (deadline_surplus);
+            tsk_rt(t)->job_params.release += (period_surplus);
+        }
+        else if (action == eLOWER_CRIT){
+           // tsk_rt(t)->job_params.exec_time += (budget_surplus);
+            tsk_rt(t)->job_params.deadline -= (deadline_surplus);
+            tsk_rt(t)->job_params.release -= (period_surplus);
+        }
+       if(!budget_remaining(t)){
+           prepare_for_next_period(t);
+           status = 0;
+       }
     }
     return status;
 }
 
-/*An idle instant occured, lower the criticality accordingly.
- **/
-static void lower_criticality(void)
+static void requeue(struct task_struct* t, rt_domain_t *edf)
 {
-    if(current_criticality > 0){
-        current_criticality -= 1;
-
-    } 
-    if(current_criticality == 0){
-        /*Clear all of the tasks from runqueue bin. No need to monitor that
-         * */
-        bheap_iterate_delete(edf_ready_order,&elastic_ready_bin);
-
+	if (t->state != TASK_RUNNING)
+		TRACE_TASK(t, "requeue: !TASK_RUNNING\n");
+	tsk_rt(t)->completed = 0;
+	if (is_early_releasing(t) || is_released(t, litmus_clock())){
+		__add_ready(edf, t);
     }
-    /*Iterate and move tasks of current criticality back to release queue.
-     * Handle expired deadlines.
-     * First parameter being the pointer to the function that does proper 
-     * parameter reset.
-     * */
-    bheap_iterate_add(elastic_reset_params,edf_ready_order,&elastic.release_queue,&elastic_release_bin);
-
+	else{
+		add_release(edf, t); /* it has got to wait */
+    }
 }
-static int cpu_lower_prio(struct bheap_node *_a, struct bheap_node *_b)
+
+/* we assume the lock is being held */
+static void preempt(edfvd_domain_t *edfvd)
 {
-	cpu_entry_t *a, *b;
-	a = _a->value;
-	b = _b->value;
-	/* Note that a and b are inverted: we want the lowest-priority CPU at
-	 * the top of the heap.
+	preempt_if_preemptable(edfvd->scheduled, edfvd->cpu);
+}
+
+#ifdef CONFIG_LITMUS_LOCKING
+
+static void boost_priority(struct task_struct* t)
+{
+	unsigned long		flags;
+	edfvd_domain_t* 	edfvd = &local_domain;
+	lt_t			now;
+
+	raw_spin_lock_irqsave(&edfvd->slock, flags);
+	now = litmus_clock();
+
+	TRACE_TASK(t, "priority boosted at %llu\n", now);
+
+	tsk_rt(t)->priority_boosted = 1;
+	tsk_rt(t)->boost_start_time = now;
+
+	if (edfvd->scheduled != t) {
+		/* holder may be queued: first stop queue changes */
+		raw_spin_lock(&edfvd->domain.release_lock);
+		if (is_queued(t) &&
+		    /* If it is queued, then we need to re-order. */
+		    bheap_decrease(edf_ready_order, tsk_rt(t)->heap_node) &&
+		    /* If we bubbled to the top, then we need to check for preemptions. */
+		    edf_preemption_needed(&edfvd->domain, edfvd->scheduled))
+				preempt(edfvd);
+		raw_spin_unlock(&edfvd->domain.release_lock);
+	} /* else: nothing to do since the job is not queued while scheduled */
+
+	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
+}
+
+static void unboost_priority(struct task_struct* t)
+{
+	unsigned long		flags;
+	edfvd_domain_t* 	edfvd = &local_domain;
+	lt_t			now;
+
+	raw_spin_lock_irqsave(&edfvd->slock, flags);
+	now = litmus_clock();
+
+	/* Assumption: this only happens when the job is scheduled.
+	 * Exception: If t transitioned to non-real-time mode, we no longer
+	 * care about it. */
+	BUG_ON(edfvd->scheduled != t && is_realtime(t));
+
+	TRACE_TASK(t, "priority restored at %llu\n", now);
+
+	tsk_rt(t)->priority_boosted = 0;
+	tsk_rt(t)->boost_start_time = 0;
+
+	/* check if this changes anything */
+	if (edf_preemption_needed(&edfvd->domain, edfvd->scheduled))
+		preempt(edfvd);
+
+	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
+}
+
+#endif
+
+static int edfvd_preempt_check(edfvd_domain_t *edfvd)
+{
+	if (edf_preemption_needed(&edfvd->domain, edfvd->scheduled)) {
+		preempt(edfvd);
+		return 1;
+	} else
+		return 0;
+}
+
+/* This check is trivial in partioned systems as we only have to consider
+ * the CPU of the partition.
+ */
+static int edfvd_check_resched(rt_domain_t *edf)
+{
+	edfvd_domain_t *edfvd = container_of(edf, edfvd_domain_t, domain);
+
+	/* because this is a callback from rt_domain_t we already hold
+	 * the necessary lock for the ready queue
 	 */
-	return edf_higher_prio(b->linked, a->linked);
+	return edfvd_preempt_check(edfvd);
 }
 
-/* update_cpu_position - Move the cpu entry to the correct place to maintain
- *                       order in the cpu queue. Caller must hold elastic lock.
- */
-static void update_cpu_position(cpu_entry_t *entry)
+static void job_completion(struct task_struct* t, int forced)
 {
-	if (likely(bheap_node_in_heap(entry->hn)))
-		bheap_delete(cpu_lower_prio, &elastic_cpu_heap, entry->hn);
-	bheap_insert(cpu_lower_prio, &elastic_cpu_heap, entry->hn);
-}
-
-/* caller must hold elastic lock */
-static cpu_entry_t* lowest_prio_cpu(void)
-{
-	struct bheap_node* hn;
-	hn = bheap_peek(cpu_lower_prio, &elastic_cpu_heap);
-	return hn->value;
-}
-
-
-/* link_task_to_cpu - Update the link of a CPU.
- *                    Handles the case where the to-be-linked task is already
- *                    scheduled on a different CPU.
- */
-static noinline void link_task_to_cpu(struct task_struct* linked,
-				      cpu_entry_t *entry)
-{
-	cpu_entry_t *sched;
-	struct task_struct* tmp;
-	int on_cpu;
-
-	BUG_ON(linked && !is_realtime(linked));
-
-	/* Currently linked task is set to be unlinked. */
-	if (entry->linked) {
-		entry->linked->rt_param.linked_on = NO_CPU;
-	}
-
-	/* Link new task to CPU. */
-	if (linked) {
-		/* handle task is already scheduled somewhere! */
-		on_cpu = linked->rt_param.scheduled_on;
-		if (on_cpu != NO_CPU) {
-			sched = &per_cpu(elastic_cpu_entries, on_cpu);
-			/* this should only happen if not linked already */
-			BUG_ON(sched->linked == linked);
-
-			/* If we are already scheduled on the CPU to which we
-			 * wanted to link, we don't need to do the swap --
-			 * we just link ourselves to the CPU and depend on
-			 * the caller to get things right.
-			 */
-			if (entry != sched) {
-				TRACE_TASK(linked,
-					   "already scheduled on %d, updating link.\n",
-					   sched->cpu);
-				tmp = sched->linked;
-				linked->rt_param.linked_on = sched->cpu;
-				sched->linked = linked;
-				update_cpu_position(sched);
-				linked = tmp;
-			}
-		}
-		if (linked) /* might be NULL due to swap */
-			linked->rt_param.linked_on = entry->cpu;
-	}
-	entry->linked = linked;
-#ifdef WANT_ALL_SCHED_EVENTS
-	if (linked)
-		TRACE_TASK(linked, "linked to %d.\n", entry->cpu);
-	else
-		TRACE("NULL linked to %d.\n", entry->cpu);
-#endif
-	update_cpu_position(entry);
-}
-
-/* unlink - Make sure a task is not linked any longer to an entry
- *          where it was linked before. Must hold elastic_lock.
- */
-static noinline void unlink(struct task_struct* t)
-{
-	cpu_entry_t *entry;
-
-	if (t->rt_param.linked_on != NO_CPU) {
-		/* unlink */
-		entry = &per_cpu(elastic_cpu_entries, t->rt_param.linked_on);
-		t->rt_param.linked_on = NO_CPU;
-		link_task_to_cpu(NULL, entry);
-	} else if (is_queued(t)) {
-		/* This is an interesting situation: t is scheduled,
-		 * but was just recently unlinked.  It cannot be
-		 * linked anywhere else (because then it would have
-		 * been relinked to this CPU), thus it must be in some
-		 * queue. We must remove it from the list in this
-		 * case.
-		 */
-		remove(&elastic, t);
-	}
-}
-
-
-/* preempt - force a CPU to reschedule
- */
-static void preempt(cpu_entry_t *entry)
-{
-	preempt_if_preemptable(entry->scheduled, entry->cpu);
-}
-
-/* requeue - Put an unlinked task into elastic domain.
- *           Caller must hold elastic_lock.
- */
-static noinline void requeue(struct task_struct* task)
-{
-	BUG_ON(!task);
-	/* sanity check before insertion */
-	BUG_ON(is_queued(task));
-
-	if (is_early_releasing(task) || is_released(task, litmus_clock()))
-		__add_ready(&elastic, task);
-	else {
-		/* it has got to wait */
-		add_release(&elastic, task);
-	}
-}
-
-#ifdef CONFIG_SCHED_CPU_AFFINITY
-static cpu_entry_t* elastic_get_nearest_available_cpu(cpu_entry_t *start)
-{
-	cpu_entry_t *affinity;
-
-	get_nearest_available_cpu(affinity, start, elastic_cpu_entries,
-#ifdef CONFIG_RELEASE_MASTER
-			elastic.release_master,
-#else
-			NO_CPU,
-#endif
-            cpu_online_mask
-			);
-
-	return(affinity);
-}
-#endif
-
-/* check for any necessary preemptions */
-static void check_for_preemptions(void)
-{
-	struct task_struct *task;
-	cpu_entry_t *last;
-
-
-#ifdef CONFIG_PREFER_LOCAL_LINKING
-	cpu_entry_t *local;
-
-	/* Before linking to other CPUs, check first whether the local CPU is
-	 * idle. */
-	local = this_cpu_ptr(&elastic_cpu_entries);
-	task  = __peek_ready(&elastic);
-
-	if (task && !local->linked
-#ifdef CONFIG_RELEASE_MASTER
-	    && likely(local->cpu != elastic.release_master)
-#endif
-		) {
-		task = __take_ready(&elastic);
-		TRACE_TASK(task, "linking to local CPU %d to avoid IPI\n", local->cpu);
-		link_task_to_cpu(task, local);
-		preempt(local);
-	}
-#endif
-
-	for (last = lowest_prio_cpu();
-	     edf_preemption_needed(&elastic, last->linked);
-	     last = lowest_prio_cpu()) {
-		/* preemption necessary */
-		task = __take_ready(&elastic);
-		TRACE("check_for_preemptions: attempting to link task %d to %d\n",
-		      task->pid, last->cpu);
-
-#ifdef CONFIG_SCHED_CPU_AFFINITY
-		{
-			cpu_entry_t *affinity =
-					elastic_get_nearest_available_cpu(
-						&per_cpu(elastic_cpu_entries, task_cpu(task)));
-			if (affinity)
-				last = affinity;
-			else if (requeue_preempted_job(last->linked))
-				requeue(last->linked);
-		}
-#else
-		if (requeue_preempted_job(last->linked))
-			requeue(last->linked);
-#endif
-
-		link_task_to_cpu(task, last);
-		preempt(last);
-	}
-}
-
-/* elastic_job_arrival: task is either resumed or released */
-static noinline void elastic_job_arrival(struct task_struct* task)
-{
-	BUG_ON(!task);
-
-	requeue(task);
-	check_for_preemptions();
-}
-
-static void elastic_release_jobs(rt_domain_t* rt, struct bheap* tasks)
-{
-	unsigned long flags;
-
-	raw_spin_lock_irqsave(&elastic_lock, flags);
-
-	__merge_ready(rt, tasks);
-	check_for_preemptions();
-
-	raw_spin_unlock_irqrestore(&elastic_lock, flags);
-}
-
-/* caller holds gsnedf_lock */
-static noinline void curr_job_completion(int forced)
-{
-	struct task_struct *t = current;
-	BUG_ON(!t);
-
 	sched_trace_task_completion(t, forced);
-
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
 
-	/* set flags */
 	tsk_rt(t)->completed = 0;
-	/* prepare for next period */
 	prepare_for_next_period(t);
-	if (is_early_releasing(t) || is_released(t, litmus_clock()))
-		sched_trace_task_release(t);
-	/* unlink */
-	unlink(t);
-	/* requeue
-	 * But don't requeue a blocking task. */
-	if (is_current_running())
-		elastic_job_arrival(t);
 }
 
-/* Getting schedule() right is a bit tricky. schedule() may not make any
- * assumptions on the state of the current task since it may be called for a
- * number of reasons. The reasons include a scheduler_tick() determined that it
- * was necessary, because sys_exit_np() was called, because some Linux
- * subsystem determined so, or even (in the worst case) because there is a bug
- * hidden somewhere. Thus, we must take extreme care to determine what the
- * current state is.
- *
- * The CPU could currently be scheduling a task (or not), be linked (or not).
- *
- * The following assertions for the scheduled task could hold:
- *
- *      - !is_running(scheduled)        // the job blocks
- *	- scheduled->timeslice == 0	// the job completed (forcefully)
- *	- is_completed()		// the job completed (by syscall)
- * 	- linked != scheduled		// we need to reschedule (for any reason)
- * 	- is_np(scheduled)		// rescheduling must be delayed,
- *					   sys_exit_np must be requested
- *
- * Any of these can occur together.
- */
-static struct task_struct* elastic_schedule(struct task_struct * prev)
+static struct task_struct* edfvd_schedule(struct task_struct * prev)
 {
-	cpu_entry_t* entry = this_cpu_ptr(&elastic_cpu_entries);
-	int out_of_time, sleep, preempt, np, exists, blocks;
-	struct task_struct* next = NULL;
-
-#ifdef CONFIG_RELEASE_MASTER
-	/* Bail out early if we are the release master.
-	 * The release master never schedules any real-time tasks.
+	edfvd_domain_t* 	edfvd = &local_domain;
+	rt_domain_t*		edf  = &edfvd->domain;
+	struct task_struct*	next;
+    
+	int 			out_of_time, sleep, preempt,
+				np, exists, blocks, resched;
+   
+	raw_spin_lock(&edfvd->slock);
+	/* sanity checking
+	 * differently from gedf, when a task exits (dead)
+	 * edfvd->schedule may be null and prev _is_ realtime
 	 */
-	if (unlikely(elastic.release_master == entry->cpu)) {
-		sched_state_task_picked();
-		return NULL;
-	}
-#endif
-
-	raw_spin_lock(&elastic_lock);
-    handle_criticality(prev);
-	/* sanity checking */
-	BUG_ON(entry->scheduled && entry->scheduled != prev);
-	BUG_ON(entry->scheduled && !is_realtime(prev));
-	BUG_ON(is_realtime(prev) && !entry->scheduled);
-
+	BUG_ON(edfvd->scheduled && edfvd->scheduled != prev);
+	BUG_ON(edfvd->scheduled && !is_realtime(prev));
+    
 	/* (0) Determine state */
-	exists      = entry->scheduled != NULL;
+	exists      = edfvd->scheduled != NULL;
 	blocks      = exists && !is_current_running();
-	out_of_time = exists && budget_enforced(entry->scheduled)
-		&& budget_exhausted(entry->scheduled);
-	np 	    = exists && is_np(entry->scheduled);
-	sleep	    = exists && is_completed(entry->scheduled);
-	preempt     = entry->scheduled != entry->linked;
+	out_of_time = exists && budget_enforced(edfvd->scheduled)
+			     && budget_exhausted(edfvd->scheduled);
+	np 	    = exists && is_np(edfvd->scheduled);
+	sleep	    = exists && is_completed(edfvd->scheduled);
+	preempt     = edf_preemption_needed(edf, prev);
 
-#ifdef WANT_ALL_SCHED_EVENTS
-	TRACE_TASK(prev, "invoked elastic_schedule.\n");
-#endif
+    if(exists && !budget_precisely_enforced(edfvd->scheduled))
+        BUG_ON(exists);
+	/* If we need to preempt do so.
+	 * The following checks set resched to 1 in case of special
+	 * circumstances.
+	 */
+	resched = preempt;
 
-	if (exists)
-		TRACE_TASK(prev,
-			   "blocks:%d out_of_time:%d np:%d sleep:%d preempt:%d "
-			   "state:%d sig:%d\n",
-			   blocks, out_of_time, np, sleep, preempt,
-			   prev->state, signal_pending(prev));
-	if (entry->linked && preempt)
-		TRACE_TASK(prev, "will be preempted by %s/%d\n",
-			   entry->linked->comm, entry->linked->pid);
+    /*Enforcement timer fired, but task did not mark completion.*/
+    if(!np && (out_of_time ||sleep)){
+        /*Condition 1: - Handle budget overrun.*/
+        if(out_of_time){
+            BUG_ON(!exists);
+            /*Budget overrun occurred, raise system criticality.*/
+            /*Change criticality only for a high crit overrun.*/
+            if(is_task_high_crit(edfvd->scheduled)){
+                printk(KERN_WARNING"Budget Overrun occurred..\n");
+                if(raise_system_criticality()){
 
+                    /**Update task control page to notify user space
+                     * of the change in criticality.**/
+                    if(has_control_page(edfvd->scheduled)){
+                        struct control_page* cp  = get_control_page(edfvd->scheduled);
+                        cp->active_crit = current_criticality;
+                    }
+                    if(replenish_task_for_mode(edfvd->scheduled, eRAISE_CRIT)){
+                        resched = 0;
+                        exists = 1;
+                    }
+                    else{
+                         /*Handle condition when task in run queue for too
+                          * long and wakes with large time delta.*/
+                         resched = 1;
+                    }
+                }
+                else{
+                    /*System criticality ceiling reached, mark and reschedule.*/
+                    job_completion(edfvd->scheduled, !sleep);
+                    resched = 1;
+                }
+            }
+            else{
+                /*Overrun task is low crit, mark completed and recshedule.*/
+                printk(KERN_WARNING"Low crit budget overrun..\n");
+                job_completion(edfvd->scheduled, !sleep);
+                resched = 1;
+               }
+       }
+        /*Condition 2: Handle task completion.*/
+       else if(sleep){
+            job_completion(edfvd->scheduled, !sleep);
+		    resched = 1;
+       } 
+       else{
+           /*unlikely state.*/
+           printk(KERN_WARNING"Unlikely error state hit..\n");
+          // BUG_ON(out_of_time && sleep);
+       }
+    }
+    else{
+        if(exists && !blocks){
+            printk(KERN_WARNING"Undefined scheduler state..\n");
+            resched = 1;
+           // BUG_ON(exists);
+        }
+    }
+    /*Handle a task that was pushed to ready queue before a criticality 
+     * change. Rather than moving all release queue, skip when the task is
+     * scheduled and move it low crit heap.*/
 
 	/* If a task blocks we have no choice but to reschedule.
 	 */
-	if (blocks)
-		unlink(entry->scheduled);
-
+	if (blocks){
+		resched = 1;
+        printk(KERN_WARNING"Task in blocking state...\n");
+    }
 	/* Request a sys_exit_np() call if we would like to preempt but cannot.
-	 * We need to make sure to update the link structure anyway in case
-	 * that we are still linked. Multiple calls to request_exit_np() don't
-	 * hurt.
+	 * Multiple calls to request_exit_np() don't hurt.
 	 */
-	if (np && (out_of_time || preempt || sleep)) {
-		unlink(entry->scheduled);
-		request_exit_np(entry->scheduled);
-	}
-
-	/* Any task that is preemptable and either exhausts its execution
-	 * budget or wants to sleep completes. We may have to reschedule after
-	 * this. Don't do a job completion if we block (can't have timers running
-	 * for blocked jobs).
-	 */
-	if (!np && (out_of_time || sleep))
-		curr_job_completion(!sleep);
-
-	/* Link pending task if we became unlinked.
-	 */
-	if (!entry->linked)
-		link_task_to_cpu(__take_ready(&elastic), entry);
-
+	if (np && (out_of_time || preempt || sleep)){
+		request_exit_np(edfvd->scheduled);
+        BUG_ON(1);
+        }
+    
 	/* The final scheduling decision. Do we need to switch for some reason?
-	 * If linked is different from scheduled, then select linked as next.
+	 * Switch if we are in RT mode and have no task or if we need to
+	 * resched.
 	 */
-	if ((!np || blocks) &&
-	    entry->linked != entry->scheduled) {
-		/* Schedule a linked job? */
-		if (entry->linked) {
-			entry->linked->rt_param.scheduled_on = entry->cpu;
-			next = entry->linked;
-			TRACE_TASK(next, "scheduled_on = P%d\n", smp_processor_id());
-		}
-		if (entry->scheduled) {
-			/* not gonna be scheduled soon */
-			entry->scheduled->rt_param.scheduled_on = NO_CPU;
-			TRACE_TASK(entry->scheduled, "scheduled_on = NO_CPU\n");
-		}
-	} else
-		/* Only override Linux scheduler if we have a real-time task
+	next = NULL;
+	if ((!np || blocks) && (resched || !exists)) {
+		/* When preempting a task that does not block, then
+		 * re-insert it into either the ready queue or the
+		 * release queue (if it completed). requeue() picks
+		 * the appropriate queue.
+		 */
+        if(exists)
+        if (exists && !blocks){
+            /*Handle scheduled task for preemption.*/
+            if(is_task_eligible(edfvd->scheduled)){
+                /*If completed task is eligible, then requeue, else store.*/
+			        requeue(edfvd->scheduled, edf);
+                }
+                else{
+                    add_low_crit_to_wait_queue(edfvd->scheduled);
+                }
+            }
+        /*Pick next ready task.*/
+        prev = __take_ready(edf);
+        /*If picked task is not eligible search till find one.*/
+        while(!is_task_eligible(prev) && (prev != NULL)){
+            add_low_crit_to_wait_queue(prev);
+            prev = __take_ready(edf);
+        }
+        next = prev;
+	} else{
+        /* Only override Linux scheduler if we have a real-time task
 		 * scheduled that needs to continue.
 		 */
+        printk(KERN_WARNING"Overriding criteria..\n");
 		if (exists)
 			next = prev;
+    }
 
-	sched_state_task_picked();
-    if(exists && !next)
-        lower_criticality();
-	raw_spin_unlock(&elastic_lock);
-
-#ifdef WANT_ALL_SCHED_EVENTS
-	TRACE("elastic_lock released, next=0x%p\n", next);
-
-	if (next)
+	if (next) {
 		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
-	else if (exists && !next)
-		TRACE("becomes idle at %llu.\n", litmus_clock());
-#endif
-
-
+	} else {
+        /*Idle instance encoutered, force a low task to be run as 
+         * background, or lower the criticality.*/
+       // TRACE("becoming idle and lowering criticality at: %llu\n", litmus_clock());
+       // lower_system_criticality();
+	}
+   /** if(next){
+        printk(KERN_ERR"Budget Exiting..\n");
+        printk(KERN_ERR"Execution cost: %llu\n", get_exec_cost(next));
+        printk(KERN_ERR"Execution time: %llu\n", get_exec_time(next));
+        if(next == edfvd->scheduled)
+            BUG_ON(budget_exhausted(next));
+    }**/
+	edfvd->scheduled = next;
+	sched_state_task_picked();
+	raw_spin_unlock(&edfvd->slock);
 	return next;
-}
-
-
-/* _finish_switch - we just finished the switch away from prev
- */
-static void elastic_finish_switch(struct task_struct *prev)
-{
-	cpu_entry_t* 	entry = this_cpu_ptr(&elastic_cpu_entries);
-
-	entry->scheduled = is_realtime(current) ? current : NULL;
-#ifdef WANT_ALL_SCHED_EVENTS
-	TRACE_TASK(prev, "switched away from\n");
-#endif
 }
 
 
 /*	Prepare a task for running in RT mode
  */
-static void elastic_task_new(struct task_struct * t, int on_rq, int is_scheduled)
+static void edfvd_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 {
-	unsigned long 		flags;
-	cpu_entry_t* 		entry;
+	rt_domain_t* 		edf  = &local_domain.domain;
+	edfvd_domain_t* 	edfvd = &local_domain;
+	unsigned long		flags;
 
-	TRACE("elastic: task new %d\n", t->pid);
+	TRACE_TASK(t, "psn edf: task new, cpu = %d\n",
+		   t->rt_param.task_params.cpu);
 
-	raw_spin_lock_irqsave(&elastic_lock, flags);
-
-	/* setup job params */
+    printk(KERN_WARNING"New task release..\n");
+	/* setup job parameters */
 	release_at(t, litmus_clock());
 
+	/* The task should be running in the queue, otherwise signal
+	 * code will try to wake it up with fatal consequences.
+	 */
+	raw_spin_lock_irqsave(&edfvd->slock, flags);
 	if (is_scheduled) {
-		entry = &per_cpu(elastic_cpu_entries, task_cpu(t));
-		BUG_ON(entry->scheduled);
-
-#ifdef CONFIG_RELEASE_MASTER
-		if (entry->cpu != elastic.release_master) {
-#endif
-			entry->scheduled = t;
-			tsk_rt(t)->scheduled_on = task_cpu(t);
-#ifdef CONFIG_RELEASE_MASTER
-		} else {
-			/* do not schedule on release master */
-			preempt(entry); /* force resched */
-			tsk_rt(t)->scheduled_on = NO_CPU;
-		}
-#endif
+		/* there shouldn't be anything else scheduled at the time */
+		BUG_ON(edfvd->scheduled);
+        TRACE("New task scheduled..\n");
+		edfvd->scheduled = t;
 	} else {
-		t->rt_param.scheduled_on = NO_CPU;
+		/* !is_scheduled means it is not scheduled right now, but it
+		 * does not mean that it is suspended. If it is not suspended,
+		 * it still needs to be requeued. If it is suspended, there is
+		 * nothing that we need to do as it will be handled by the
+		 * wake_up() handler. */
+		if (on_rq) {
+			requeue(t, edf);
+			/* maybe we have to reschedule */
+			edfvd_preempt_check(edfvd);
+		}
 	}
-	t->rt_param.linked_on          = NO_CPU;
-
-	if (on_rq || is_scheduled)
-		elastic_job_arrival(t);
-	raw_spin_unlock_irqrestore(&elastic_lock, flags);
+	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
 }
 
-static void elastic_task_wake_up(struct task_struct *task)
+static void edfvd_task_wake_up(struct task_struct *task)
 {
-	unsigned long flags;
-	lt_t now;
-
+	unsigned long		flags;
+	edfvd_domain_t* 	edfvd = &local_domain;
+	rt_domain_t* 		edf  = &local_domain.domain;
+	lt_t			now;
+    printk(KERN_WARNING"Wakeup the new task..\n");
 	TRACE_TASK(task, "wake_up at %llu\n", litmus_clock());
-
-	raw_spin_lock_irqsave(&elastic_lock, flags);
+	raw_spin_lock_irqsave(&edfvd->slock, flags);
+	BUG_ON(is_queued(task));
 	now = litmus_clock();
-	if (is_sporadic(task) && is_tardy(task, now)) {
-		/* new sporadic release */
-		release_at(task, now);
-		sched_trace_task_release(task);
+	if (is_sporadic(task) && is_tardy(task, now)
+#ifdef CONFIG_LITMUS_LOCKING
+	/* We need to take suspensions because of semaphores into
+	 * account! If a job resumes after being suspended due to acquiring
+	 * a semaphore, it should never be treated as a new job release.
+	 */
+	    && !is_priority_boosted(task)
+#endif
+		) {
+			inferred_sporadic_job_release_at(task, now);
 	}
-	elastic_job_arrival(task);
-	raw_spin_unlock_irqrestore(&elastic_lock, flags);
+
+	/* Only add to ready queue if it is not the currently-scheduled
+	 * task. This could be the case if a task was woken up concurrently
+	 * on a remote CPU before the executing CPU got around to actually
+	 * de-scheduling the task, i.e., wake_up() raced with schedule()
+	 * and won.
+	 */
+	if (edfvd->scheduled != task) {
+        /*If the waken task is not eligible on current crit, move to 
+         * waiting release queue.
+         * */
+        if(edfvd->scheduled == NULL)
+            printk(KERN_WARNING"No previous scheduled task..\n");
+        //release_at(task, litmus_clock());
+        printk(KERN_WARNING"Woken up task not same as current..: Requeued\n");
+		requeue(task, edf);
+		if(!edfvd_preempt_check(edfvd)){
+            printk(KERN_WARNING"No preemption done..\n");
+        }
+	}
+
+	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
+	TRACE_TASK(task, "wake up done\n");
 }
 
-static void elastic_task_block(struct task_struct *t)
+static void edfvd_task_block(struct task_struct *t)
 {
-	unsigned long flags;
-
-	TRACE_TASK(t, "block at %llu\n", litmus_clock());
-
-	/* unlink if necessary */
-	raw_spin_lock_irqsave(&elastic_lock, flags);
-	unlink(t);
-	raw_spin_unlock_irqrestore(&elastic_lock, flags);
+	/* only running tasks can block, thus t is in no queue */
+	TRACE_TASK(t, "block at %llu, state=%d\n", litmus_clock(), t->state);
 
 	BUG_ON(!is_realtime(t));
+	BUG_ON(is_queued(t));
 }
 
-
-static void elastic_task_exit(struct task_struct * t)
+static void edfvd_task_exit(struct task_struct * t)
 {
 	unsigned long flags;
+	edfvd_domain_t* 	edfvd = &local_domain;
+	rt_domain_t*		edf;
 
-	/* unlink if necessary */
-	raw_spin_lock_irqsave(&elastic_lock, flags);
-	unlink(t);
-	if (tsk_rt(t)->scheduled_on != NO_CPU) {
-		elastic_cpus[tsk_rt(t)->scheduled_on]->scheduled = NULL;
-		tsk_rt(t)->scheduled_on = NO_CPU;
+	raw_spin_lock_irqsave(&edfvd->slock, flags);
+	if (is_queued(t)) {
+		/* dequeue */
+		edf  = &local_domain.domain;
+		remove(edf, t);
 	}
-	raw_spin_unlock_irqrestore(&elastic_lock, flags);
+	if (edfvd->scheduled == t)
+		edfvd->scheduled = NULL;
 
-	BUG_ON(!is_realtime(t));
-        TRACE_TASK(t, "RIP\n");
-}
+	TRACE_TASK(t, "RIP, now reschedule\n");
 
-
-static long elastic_admit_task(struct task_struct* tsk)
-{
-	return 0;
+	preempt(edfvd);
+	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
 }
 
 #ifdef CONFIG_LITMUS_LOCKING
 
 #include <litmus/fdso.h>
+#include <litmus/srp.h>
 
-/* called with IRQs off */
-static void set_priority_inheritance(struct task_struct* t, struct task_struct* prio_inh)
+/* ******************** SRP support ************************ */
+
+static unsigned int edfvd_get_srp_prio(struct task_struct* t)
 {
-	int linked_on;
-	int check_preempt = 0;
-
-	raw_spin_lock(&elastic_lock);
-
-	TRACE_TASK(t, "inherits priority from %s/%d\n", prio_inh->comm, prio_inh->pid);
-	tsk_rt(t)->inh_task = prio_inh;
-
-	linked_on  = tsk_rt(t)->linked_on;
-
-	/* If it is scheduled, then we need to reorder the CPU heap. */
-	if (linked_on != NO_CPU) {
-		TRACE_TASK(t, "%s: linked  on %d\n",
-			   __FUNCTION__, linked_on);
-		/* Holder is scheduled; need to re-order CPUs.
-		 * We can't use heap_decrease() here since
-		 * the cpu_heap is ordered in reverse direction, so
-		 * it is actually an increase. */
-		bheap_delete(cpu_lower_prio, &elastic_cpu_heap,
-			    elastic_cpus[linked_on]->hn);
-		bheap_insert(cpu_lower_prio, &elastic_cpu_heap,
-			    elastic_cpus[linked_on]->hn);
-	} else {
-		/* holder may be queued: first stop queue changes */
-		raw_spin_lock(&elastic.release_lock);
-		if (is_queued(t)) {
-			TRACE_TASK(t, "%s: is queued\n",
-				   __FUNCTION__);
-			/* We need to update the position of holder in some
-			 * heap. Note that this could be a release heap if we
-			 * budget enforcement is used and this job overran. */
-			check_preempt =
-				!bheap_decrease(edf_ready_order,
-					       tsk_rt(t)->heap_node);
-		} else {
-			/* Nothing to do: if it is not queued and not linked
-			 * then it is either sleeping or currently being moved
-			 * by other code (e.g., a timer interrupt handler) that
-			 * will use the correct priority when enqueuing the
-			 * task. */
-			TRACE_TASK(t, "%s: is NOT queued => Done.\n",
-				   __FUNCTION__);
-		}
-		raw_spin_unlock(&elastic.release_lock);
-
-		/* If holder was enqueued in a release heap, then the following
-		 * preemption check is pointless, but we can't easily detect
-		 * that case. If you want to fix this, then consider that
-		 * simply adding a state flag requires O(n) time to update when
-		 * releasing n tasks, which conflicts with the goal to have
-		 * O(log n) merges. */
-		if (check_preempt) {
-			/* heap_decrease() hit the top level of the heap: make
-			 * sure preemption checks get the right task, not the
-			 * potentially stale cache. */
-			bheap_uncache_min(edf_ready_order,
-					 &elastic.ready_queue);
-			check_for_preemptions();
-		}
-	}
-
-	raw_spin_unlock(&elastic_lock);
+	return get_rt_relative_deadline(t);
 }
-
-/* called with IRQs off */
-static void clear_priority_inheritance(struct task_struct* t)
-{
-	raw_spin_lock(&elastic_lock);
-
-	/* A job only stops inheriting a priority when it releases a
-	 * resource. Thus we can make the following assumption.*/
-	BUG_ON(tsk_rt(t)->scheduled_on == NO_CPU);
-
-	TRACE_TASK(t, "priority restored\n");
-	tsk_rt(t)->inh_task = NULL;
-
-	/* Check if rescheduling is necessary. We can't use heap_decrease()
-	 * since the priority was effectively lowered. */
-	unlink(t);
-	elastic_job_arrival(t);
-
-	raw_spin_unlock(&elastic_lock);
-}
-
 
 /* ******************** FMLP support ********************** */
 
@@ -837,9 +590,6 @@ struct fmlp_semaphore {
 	/* current resource holder */
 	struct task_struct *owner;
 
-	/* highest-priority waiter */
-	struct task_struct *hp_waiter;
-
 	/* FIFO queue of waiting tasks */
 	wait_queue_head_t wait;
 };
@@ -848,26 +598,7 @@ static inline struct fmlp_semaphore* fmlp_from_lock(struct litmus_lock* lock)
 {
 	return container_of(lock, struct fmlp_semaphore, litmus_lock);
 }
-
-/* caller is responsible for locking */
-static struct task_struct* find_hp_waiter(struct fmlp_semaphore *sem,
-				   struct task_struct* skip)
-{
-	struct list_head	*pos;
-	struct task_struct 	*queued, *found = NULL;
-
-	list_for_each(pos, &sem->wait.task_list) {
-		queued  = (struct task_struct*) list_entry(pos, wait_queue_t,
-							   task_list)->private;
-
-		/* Compare task prios, find high prio task. */
-		if (queued != skip && edf_higher_prio(queued, found))
-			found = queued;
-	}
-	return found;
-}
-
-int elastic_fmlp_lock(struct litmus_lock* l)
+int edfvd_fmlp_lock(struct litmus_lock* l)
 {
 	struct task_struct* t = current;
 	struct fmlp_semaphore *sem = fmlp_from_lock(l);
@@ -878,7 +609,8 @@ int elastic_fmlp_lock(struct litmus_lock* l)
 		return -EPERM;
 
 	/* prevent nested lock acquisition --- not supported by FMLP */
-	if (tsk_rt(t)->num_locks_held)
+	if (tsk_rt(t)->num_locks_held ||
+	    tsk_rt(t)->num_local_locks_held)
 		return -EBUSY;
 
 	spin_lock_irqsave(&sem->wait.lock, flags);
@@ -892,13 +624,6 @@ int elastic_fmlp_lock(struct litmus_lock* l)
 		set_task_state(t, TASK_UNINTERRUPTIBLE);
 
 		__add_wait_queue_tail_exclusive(&sem->wait, &wait);
-
-		/* check if we need to activate priority inheritance */
-		if (edf_higher_prio(t, sem->hp_waiter)) {
-			sem->hp_waiter = t;
-			if (edf_higher_prio(t, sem->owner))
-				set_priority_inheritance(sem->owner, sem->hp_waiter);
-		}
 
 		TS_LOCK_SUSPEND;
 
@@ -922,6 +647,9 @@ int elastic_fmlp_lock(struct litmus_lock* l)
 		/* it's ours now */
 		sem->owner = t;
 
+		/* mark the task as priority-boosted. */
+		boost_priority(t);
+
 		spin_unlock_irqrestore(&sem->wait.lock, flags);
 	}
 
@@ -930,7 +658,7 @@ int elastic_fmlp_lock(struct litmus_lock* l)
 	return 0;
 }
 
-int elastic_fmlp_unlock(struct litmus_lock* l)
+int edfvd_fmlp_unlock(struct litmus_lock* l)
 {
 	struct task_struct *t = current, *next;
 	struct fmlp_semaphore *sem = fmlp_from_lock(l);
@@ -946,49 +674,31 @@ int elastic_fmlp_unlock(struct litmus_lock* l)
 
 	tsk_rt(t)->num_locks_held--;
 
+	/* we lose the benefit of priority boosting */
+
+	unboost_priority(t);
+
 	/* check if there are jobs waiting for this resource */
 	next = __waitqueue_remove_first(&sem->wait);
 	if (next) {
+		/* boost next job */
+		boost_priority(next);
+
 		/* next becomes the resouce holder */
 		sem->owner = next;
-		TRACE_CUR("lock ownership passed to %s/%d\n", next->comm, next->pid);
-
-		/* determine new hp_waiter if necessary */
-		if (next == sem->hp_waiter) {
-			TRACE_TASK(next, "was highest-prio waiter\n");
-			/* next has the highest priority --- it doesn't need to
-			 * inherit.  However, we need to make sure that the
-			 * next-highest priority in the queue is reflected in
-			 * hp_waiter. */
-			sem->hp_waiter = find_hp_waiter(sem, next);
-			if (sem->hp_waiter)
-				TRACE_TASK(sem->hp_waiter, "is new highest-prio waiter\n");
-			else
-				TRACE("no further waiters\n");
-		} else {
-			/* Well, if next is not the highest-priority waiter,
-			 * then it ought to inherit the highest-priority
-			 * waiter's priority. */
-			set_priority_inheritance(next, sem->hp_waiter);
-		}
 
 		/* wake up next */
 		wake_up_process(next);
 	} else
-		/* becomes available */
+		/* resource becomes available */
 		sem->owner = NULL;
-
-	/* we lose the benefit of priority inheritance (if any) */
-	if (tsk_rt(t)->inh_task)
-		clear_priority_inheritance(t);
 
 out:
 	spin_unlock_irqrestore(&sem->wait.lock, flags);
-
 	return err;
 }
 
-int elastic_fmlp_close(struct litmus_lock* l)
+int edfvd_fmlp_close(struct litmus_lock* l)
 {
 	struct task_struct *t = current;
 	struct fmlp_semaphore *sem = fmlp_from_lock(l);
@@ -1003,24 +713,24 @@ int elastic_fmlp_close(struct litmus_lock* l)
 	spin_unlock_irqrestore(&sem->wait.lock, flags);
 
 	if (owner)
-		elastic_fmlp_unlock(l);
+		edfvd_fmlp_unlock(l);
 
 	return 0;
 }
 
-void elastic_fmlp_free(struct litmus_lock* lock)
+void edfvd_fmlp_free(struct litmus_lock* lock)
 {
 	kfree(fmlp_from_lock(lock));
 }
 
-static struct litmus_lock_ops elastic_fmlp_lock_ops = {
-	.close  = elastic_fmlp_close,
-	.lock   = elastic_fmlp_lock,
-	.unlock = elastic_fmlp_unlock,
-	.deallocate = elastic_fmlp_free,
+static struct litmus_lock_ops edfvd_fmlp_lock_ops = {
+	.close  = edfvd_fmlp_close,
+	.lock   = edfvd_fmlp_lock,
+	.unlock = edfvd_fmlp_unlock,
+	.deallocate = edfvd_fmlp_free,
 };
 
-static struct litmus_lock* elastic_new_fmlp(void)
+static struct litmus_lock* edfvd_new_fmlp(void)
 {
 	struct fmlp_semaphore* sem;
 
@@ -1029,9 +739,8 @@ static struct litmus_lock* elastic_new_fmlp(void)
 		return NULL;
 
 	sem->owner   = NULL;
-	sem->hp_waiter = NULL;
 	init_waitqueue_head(&sem->wait);
-	sem->litmus_lock.ops = &elastic_fmlp_lock_ops;
+	sem->litmus_lock.ops = &edfvd_fmlp_lock_ops;
 
 	return &sem->litmus_lock;
 }
@@ -1039,23 +748,33 @@ static struct litmus_lock* elastic_new_fmlp(void)
 /* **** lock constructor **** */
 
 
-static long elastic_allocate_lock(struct litmus_lock **lock, int type,
+static long edfvd_allocate_lock(struct litmus_lock **lock, int type,
 				 void* __user unused)
 {
 	int err = -ENXIO;
+	struct srp_semaphore* srp;
 
-	/* GSN-EDF currently only supports the FMLP for global resources. */
+	/* PSN-EDF currently supports the SRP for local resources and the FMLP
+	 * for global resources. */
 	switch (type) {
-
 	case FMLP_SEM:
 		/* Flexible Multiprocessor Locking Protocol */
-		*lock = elastic_new_fmlp();
+		*lock = edfvd_new_fmlp();
 		if (*lock)
 			err = 0;
 		else
 			err = -ENOMEM;
 		break;
 
+	case SRP_SEM:
+		/* Baker's Stack Resource Policy */
+		srp = allocate_srp_semaphore();
+		if (srp) {
+			*lock = &srp->litmus_lock;
+			err = 0;
+		} else
+			err = -ENOMEM;
+		break;
 	};
 
 	return err;
@@ -1063,120 +782,108 @@ static long elastic_allocate_lock(struct litmus_lock **lock, int type,
 
 #endif
 
-static struct domain_proc_info elastic_domain_proc_info;
-static long elastic_get_domain_proc_info(struct domain_proc_info **ret)
+static struct domain_proc_info edfvd_domain_proc_info;
+static long edfvd_get_domain_proc_info(struct domain_proc_info **ret)
 {
-	*ret = &elastic_domain_proc_info;
+	*ret = &edfvd_domain_proc_info;
 	return 0;
 }
 
-static void elastic_setup_domain_proc(void)
+static void edfvd_setup_domain_proc(void)
 {
 	int i, cpu;
 	int release_master =
 #ifdef CONFIG_RELEASE_MASTER
-			atomic_read(&release_master_cpu);
+		atomic_read(&release_master_cpu);
 #else
 		NO_CPU;
 #endif
 	int num_rt_cpus = num_online_cpus() - (release_master != NO_CPU);
-	struct cd_mapping *map;
+	struct cd_mapping *cpu_map, *domain_map;
 
-	memset(&elastic_domain_proc_info, sizeof(elastic_domain_proc_info), 1);
-	init_domain_proc_info(&elastic_domain_proc_info, num_rt_cpus, 1);
-	elastic_domain_proc_info.num_cpus = num_rt_cpus;
-	elastic_domain_proc_info.num_domains = 1;
+	memset(&edfvd_domain_proc_info, 0, sizeof(edfvd_domain_proc_info));
+	init_domain_proc_info(&edfvd_domain_proc_info, num_rt_cpus, num_rt_cpus);
+	edfvd_domain_proc_info.num_cpus = num_rt_cpus;
+	edfvd_domain_proc_info.num_domains = num_rt_cpus;
 
-	elastic_domain_proc_info.domain_to_cpus[0].id = 0;
 	for (cpu = 0, i = 0; cpu < num_online_cpus(); ++cpu) {
 		if (cpu == release_master)
 			continue;
-		map = &elastic_domain_proc_info.cpu_to_domains[i];
-		map->id = cpu;
-		cpumask_set_cpu(0, map->mask);
-		++i;
+		cpu_map = &edfvd_domain_proc_info.cpu_to_domains[i];
+		domain_map = &edfvd_domain_proc_info.domain_to_cpus[i];
 
-		/* add cpu to the domain */
-		cpumask_set_cpu(cpu,
-			elastic_domain_proc_info.domain_to_cpus[0].mask);
+		cpu_map->id = cpu;
+		domain_map->id = i; /* enumerate w/o counting the release master */
+		cpumask_set_cpu(i, cpu_map->mask);
+		cpumask_set_cpu(cpu, domain_map->mask);
+		++i;
 	}
 }
 
-static long elastic_activate_plugin(void)
+static long edfvd_activate_plugin(void)
 {
-	int cpu;
-	cpu_entry_t *entry;
-
-	bheap_init(&elastic_cpu_heap);
 #ifdef CONFIG_RELEASE_MASTER
-	elastic.release_master = atomic_read(&release_master_cpu);
-#endif
+	int cpu;
 
 	for_each_online_cpu(cpu) {
-		entry = &per_cpu(elastic_cpu_entries, cpu);
-		bheap_node_init(&entry->hn, entry);
-		entry->linked    = NULL;
-		entry->scheduled = NULL;
-#ifdef CONFIG_RELEASE_MASTER
-		if (cpu != elastic.release_master) {
-#endif
-			TRACE("GSN-EDF: Initializing CPU #%d.\n", cpu);
-			update_cpu_position(entry);
-#ifdef CONFIG_RELEASE_MASTER
-		} else {
-			TRACE("GSN-EDF: CPU %d is release master.\n", cpu);
-		}
-#endif
+		remote_edf(cpu)->release_master = atomic_read(&release_master_cpu);
 	}
+#endif
 
-	elastic_setup_domain_proc();
+#ifdef CONFIG_LITMUS_LOCKING
+	get_srp_prio = edfvd_get_srp_prio;
+#endif
+
+	edfvd_setup_domain_proc();
 
 	return 0;
 }
 
-static long elastic_deactivate_plugin(void)
+static long edfvd_deactivate_plugin(void)
 {
-	destroy_domain_proc_info(&elastic_domain_proc_info);
+	destroy_domain_proc_info(&edfvd_domain_proc_info);
 	return 0;
+}
+
+static long edfvd_admit_task(struct task_struct* tsk)
+{
+	if (task_cpu(tsk) == tsk->rt_param.task_params.cpu
+#ifdef CONFIG_RELEASE_MASTER
+	    /* don't allow tasks on release master CPU */
+	     && task_cpu(tsk) != remote_edf(task_cpu(tsk))->release_master
+#endif
+		)
+		return 0;
+	else
+		return -EINVAL;
 }
 
 /*	Plugin object	*/
-static struct sched_plugin elastic_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "ELASTIC",
-	.finish_switch		= elastic_finish_switch,
-	.task_new		= elastic_task_new,
+static struct sched_plugin psn_edf_plugin __cacheline_aligned_in_smp = {
+	.plugin_name		= "EDFVD",
+	.task_new		= edfvd_task_new,
 	.complete_job		= complete_job,
-	.task_exit		= elastic_task_exit,
-	.schedule		= elastic_schedule,
-	.task_wake_up		= elastic_task_wake_up,
-	.task_block		= elastic_task_block,
-	.admit_task		= elastic_admit_task,
-	.activate_plugin	= elastic_activate_plugin,
-	.deactivate_plugin	= elastic_deactivate_plugin,
-	.get_domain_proc_info	= elastic_get_domain_proc_info,
+	.task_exit		= edfvd_task_exit,
+	.schedule		= edfvd_schedule,
+	.task_wake_up		= edfvd_task_wake_up,
+	.task_block		= edfvd_task_block,
+	.admit_task		= edfvd_admit_task,
+	.activate_plugin	= edfvd_activate_plugin,
+	.deactivate_plugin	= edfvd_deactivate_plugin,
+	.get_domain_proc_info	= edfvd_get_domain_proc_info,
 #ifdef CONFIG_LITMUS_LOCKING
-	.allocate_lock		= elastic_allocate_lock,
+	.allocate_lock		= edfvd_allocate_lock,
 #endif
 };
 
 
-static int __init init_elastic(void)
+static int __init init_edfvd(void)
 {
-	int cpu;
-	cpu_entry_t *entry;
-
-	bheap_init(&elastic_cpu_heap);
-	/* initialize CPU state */
-	for (cpu = 0; cpu < NR_CPUS; cpu++)  {
-		entry = &per_cpu(elastic_cpu_entries, cpu);
-		elastic_cpus[cpu] = entry;
-		entry->cpu 	 = cpu;
-		entry->hn        = &elastic_heap_node[cpu];
-		bheap_node_init(&entry->hn, entry);
-	}
-	edf_domain_init(&elastic, NULL, elastic_release_jobs);
-	return register_sched_plugin(&elastic_plugin);
+    /*Register the schedule domain, still using vestige of pedf scheduler.*/
+        current_criticality = 0; /*Reinitializing for plugin switches.*/
+		edfvd_domain_init(&local_domain,
+				   edfvd_check_resched,NULL, 0);
+	return register_sched_plugin(&psn_edf_plugin);
 }
 
-
-module_init(init_elastic);
+module_init(init_edfvd);
