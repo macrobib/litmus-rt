@@ -35,8 +35,13 @@ typedef struct {
  * protects the domain and serializes scheduling decisions
  */
 #define slock domain.ready_lock
-
 } amc_domain_t;
+
+/*Core criticality actions.*/
+typedef enum{
+    eLOWER_CRIT,
+    eRAISE_CRIT
+}crit_action_t;
 
 /*AMC:
  * Store the tasks dropped from the release queue and runqueue respectively.
@@ -49,7 +54,8 @@ bheap runqueue_bin;
 
 DEFINE_PER_CPU(amc_domain_t, amc_domains);
 
-amc_domain_t* amc_doms[NR_CPUS];
+/*Single domain variable as single core considered.*/
+amc_domain_t amc_domain;
 
 #define local_amc		(this_cpu_ptr(&amc_domains))
 #define remote_dom(cpu)		(&per_cpu(amc_domains, cpu).domain)
@@ -61,6 +67,105 @@ amc_domain_t* amc_doms[NR_CPUS];
 #ifdef CONFIG_LITMUS_LOCKING
 DEFINE_PER_CPU(uint64_t,fmlp_timestamp);
 #endif
+
+/*******************Core MC Changes Start**************************/
+static struct bheap amc_release_bin[MAX_CRITICALITY_LEVEL];
+
+static int raise_system_criticality(void){
+    int status = 0;
+    if (current_criticality + 1 < system_criticality){
+        current_criticality += 1;
+        status = 1;
+        printk(KERN_DEBUG "System criticality raised due to budget overrun..\n");
+        TRACE("MC: System criticality raised..\n");
+    }
+    return status;
+}
+
+static void lower_system_criticality(void){
+    struct bheap* release_bin;
+    rt_domain_t* amc = &(amc_domain.domain);
+    if (current_criticality > 0){
+        current_criticality -= 1;
+        release_bin = &edfvd_release_bin[current_criticality];
+        update_release_heap(amc, release_bin, fp_ready_order, 1);
+    }
+    else{
+        printk(KERN_DEBUG "BUG: Tried to lower criticality below zero.\n");
+    }
+}
+
+static int amc_check_criticality(struct bheap_node* node){
+    struct task_struct* task = bheap2task(node);
+    return (is_task_elgible(task));
+}
+
+/*Add low crit task to wait queue.*/
+static void add_low_crit_to_wait_queue(struct task_struct* t){
+    struct bheap* release_bin = &amc_release_bin[current_criticality - 1];
+    bheap_insert(fp_read_order, release_bin, tsk_rt(t)->heap_node);
+}
+
+/*Update task paramter for criticality change.*/
+int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
+    int x1, x2 = 0;
+    int status = 1;
+    int budget_surplus;
+    int deadline_surplus;
+    
+    if(is_task_eligible(t)){
+        /*Replenish task if eligible at current criticality.*/
+        if(current_criticality >= 1){
+            x1 = (tsk_rt(t)->task_params).mc_param.budget[current_criticality];
+            x2 = (tsk_rt(t)->task_params).mc_param.budget[current_criticality - 1];
+            budget_surplus = x1 - x2;
+
+            x1 = (tsk_rt(t)->task_params).mc_param.deadline[current_criticality];
+            x2 = (tsk_rt(t)->task_params).mc_param.deadline[current_criticality - 1];
+            deadline_surplus = x1 - x2;
+
+            if(action == eRAISE_CRIT){
+                (tsk_rt(t)->job_params).release += (budget_surplus);
+                (tsk_rt(t)->job_params).deadline += (deadline_surplus);
+            }
+            else if(action == eLOWER_CRIT){
+                (tsk_rt(t)->job_params).release -= (budget_surplus);
+                (tsk_rt(t)->job_params).deadline -= (deadline_surplus);
+            }
+            if(!budget_remaining(t)){
+                prepare_for_next_period(t);
+                status = 0;
+            }
+        }
+        else{
+            printk(KERN_DEBUG "BUG: Replenishment called in based criticality.\n");
+        }
+    }
+    return status;
+}
+
+/*AMC: Update runqueue for current criticality similar to release queue.*/
+static void update_runqueue(){
+    
+    bheap_iterate_clear(amc_check_criticality, fp_ready_order,
+            &amc_domain->domain->release_queue, &release_queue_bin);
+    TRACE_CUR("Update the runqueue for the current criticality.");
+}
+
+static void handle_criticality(struct task_struct* prev){
+    
+    if(check_budget_overrun(prev)){
+        if(!raise_system_criticality()){
+            if(clear_rq_enabled())
+                update_release_queue();
+            update_runqueue(prev);
+        }
+    }
+    if(is_task_eligible(prev)){
+        replenish_task_for_mode(prev);
+    }
+}
+/*******************Core MC Changes END ***************************/
 
 /* we assume the lock is being held */
 static void preempt(amc_domain_t *amc)
@@ -157,43 +262,11 @@ static void job_completion(struct task_struct* t, int forced)
     TRACE_CUR("Updated the release queue for the current criticality.");
 
 }
-
-/*AMC: Update runqueue for current criticality similar to release queue.*/
-static void update_runqueue(){
-    
-    bheap_iterate_clear(amc_check_criticality, fp_ready_order,
-            &local_amc->domain->release_queue, &release_queue_bin);
-    TRACE_CUR("Update the runqueue for the current criticality.");
-}
-
-static void handle_criticality(struct task_struct* prev){
-    
-    if(check_budget_overrun(prev)){
-        if(!raise_system_criticality()){
-            if(clear_rq_enabled())
-                update_release_queue();
-            update_runqueue(prev);
-        }
-    }
-    if(is_task_eligible(prev)){
-        replenish_task_for_mode(prev);
-    }
-}
-
-static int amc_check_criticality(bheap* node){
-    struct task_struct* task = bheap2task(node);
-    return (is_task_eligible(node));
-}
-
-/*AMC+: For an idle instance being hit ,criticality need to be
- * reduced. */
-static void reduce_criticality(){
-    
-}
+*/
 
 static struct task_struct* amc_schedule(struct task_struct * prev)
 {
-	amc_domain_t* 	amc = local_amc;
+	amc_domain_t* 	amc = &local_amc;
 	struct task_struct*	next;
     
 	int out_of_time, sleep, preempt, np, exists, blocks, resched, migrate;
@@ -217,20 +290,16 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 	migrate     = exists && get_partition(amc->scheduled) != amc->cpu;
 	preempt     = !blocks && (migrate || fp_preemption_needed(&amc->ready_queue, prev));
 
-#ifdef ENABLE_AMC
     /*Main logical components of the AMC are part of the offline strategies.
      *Runtime mechanism involves monitoring the budget usage, transitioning
      *and recovery from High critical stages.
      * */
     handle_criticality(prev);
-#endif
-
 	/* If we need to preempt do so.
 	 * The following checks set resched to 1 in case of special
 	 * circumstances.
 	 */
 	resched = preempt;
-
 	/* If a task blocks we have no choice but to reschedule.
 	 */
 	if (blocks)
@@ -296,6 +365,10 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
 	} else if (exists) {
 		TRACE("becoming idle at %llu\n", litmus_clock());
+#ifdef CONFIG_ENABLE_AMC_RECOVERY
+        /*Lower criticality when an idle instance is encountered.*/
+        lower_system_criticality();
+#endif
 	}
 
 	amc->scheduled = next;
@@ -1109,7 +1182,7 @@ static int pcp_exceeds_ceiling(struct pcp_semaphore* ceiling,
 static void pcp_priority_inheritance(void)
 {
 	unsigned long	flags;
-	amc_domain_t* 	amc = local_amc;
+	amc_domain_t* 	amc = &amc_domain;
 
 	struct pcp_semaphore* ceiling = pcp_get_ceiling();
 	struct task_struct *blocker, *blocked;
@@ -1978,10 +2051,6 @@ static long amc_allocate_lock(struct litmus_lock **lock, int type,
 static long amc_admit_task(struct task_struct* tsk)
 {
 	if (task_cpu(tsk) == tsk->rt_param.task_params.cpu &&
-#ifdef CONFIG_RELEASE_MASTER
-	    /* don't allow tasks on release master CPU */
-	    task_cpu(tsk) != remote_dom(task_cpu(tsk))->release_master &&
-#endif
 	    litmus_is_valid_fixed_prio(get_priority(tsk)))
 		return 0;
 	else
@@ -2030,29 +2099,7 @@ static long amc_activate_plugin(void)
 #if defined(CONFIG_RELEASE_MASTER) || defined(CONFIG_LITMUS_LOCKING)
 	int cpu;
 #endif
-
-#ifdef CONFIG_RELEASE_MASTER
-	for_each_online_cpu(cpu) {
-		remote_dom(cpu)->release_master = atomic_read(&release_master_cpu);
-	}
-#endif
-
-#ifdef CONFIG_LITMUS_LOCKING
-	get_srp_prio = amc_get_srp_prio;
-
-	for_each_online_cpu(cpu) {
-		init_waitqueue_head(&per_cpu(mpcpvs_vspin_wait, cpu));
-		per_cpu(mpcpvs_vspin, cpu) = NULL;
-
-		pcp_init_state(&per_cpu(pcp_state, cpu));
-		amc_doms[cpu] = remote_amc(cpu);
-		per_cpu(fmlp_timestamp,cpu) = 0;
-	}
-
-#endif
-
 	amc_setup_domain_proc();
-
 	return 0;
 }
 
@@ -2064,7 +2111,7 @@ static long amc_deactivate_plugin(void)
 
 /*	Plugin object	*/
 static struct sched_plugin amc_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "AMC-FSNR",
+	.plugin_name		= "AMC",
 	.task_new		= amc_task_new,
 	.complete_job		= complete_job,
 	.task_exit		= amc_task_exit,
@@ -2090,9 +2137,7 @@ static int __init init_amc(void)
 	 * However, if we are so crazy to do so,
 	 * we cannot use num_online_cpu()
 	 */
-	for (i = 0; i < num_online_cpus(); i++) {
-		amc_domain_init(remote_amc(i), i);
-	}
+    amc_domain_init(&amc_domain, 0);
 	return register_sched_plugin(&amc_plugin);
 }
 
