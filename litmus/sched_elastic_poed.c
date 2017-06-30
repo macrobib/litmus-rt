@@ -1,8 +1,7 @@
 /*
- * kernel/sched_edfvd.c
- *
+ * Implementation of Elastic Preference Oriented EDF MC Scheduler(POED).
+ * Based on An Elastic Mixed-Criticality Task Model and Early-Release EDF Scheduling Algorithms Hang Zu et.al.
  */
-
 #include <linux/percpu.h>
 #include <linux/sched.h>
 #include <linux/list.h>
@@ -28,7 +27,6 @@
 #include <xen/hvc-console.h>
 #endif
 
-/************************* Slack Params: Start *************************/
 /*Enforcement timer to maintain the slack expiration.*/
 struct enforcement_timer slack_timer;
 
@@ -40,11 +38,6 @@ typedef struct slack{
     struct task_struct* task; /*Task using the slack if use is set to active*/
 }slack_t;
 
-int slack_state = 0; /*Slack state: Expired(0) or Active(1).*/
-/************************* Slack Params: End******************************/
-
-
-/***************************MC Params: Start*******************************/
 typedef struct {
 	rt_domain_t 		domain;
 	int          		cpu;
@@ -66,9 +59,6 @@ edfvd_domain_t local_domain;
 /*EDFVD: storage for the tasks removed from criticality change.*/
 static struct bheap edfvd_release_bin[MAX_CRITICALITY_LEVEL];
 
-
-/************************  MC Params: End  ********************************/
-
 static void edfvd_domain_init(edfvd_domain_t* edfvd,
 			       check_resched_needed_t check,
 			       release_jobs_t release,
@@ -79,43 +69,15 @@ static void edfvd_domain_init(edfvd_domain_t* edfvd,
 	edfvd->scheduled		= NULL;
 }
 
-/*********************Slack handler functions - Start*************************/
-
-static enum hrtimer_restart on_slack_timeout(struct hrtimer* timer){
-    struct enforcement_timer* et = container_of(timer, struct enforcement_timer,
-                                    timer);
-    unsigned long flags;
-    local_irq_save(flags);
-    et->armed = 0;
-    slack_state = 0;
-    litmus_local_reschedule();
-    local_irq_restore(flags);
-    return HRTIMER_NORESTART;
-}
-
 /*Creates a slack timer for maintaining slack queues.*/
 static void elastic_init_slack_timer(void){
-    
-}
-
-/*Calculate the default slack available in systems.
- * Recalculate for each new task created.
- * */
-static void elastic_calculate_init_slacks(void){
 
 }
 
-/*Update/Merge slack instances, remove expired slack instances.*/
-static void update_slack_queue(void){
+/*Calculate the default slack available in systems.*/
+static void elastic_calculate_init_slacks(){
 
 }
-
-/*Check if enough slack exists for an early release of new instance.*/
-static void check_slack_availability(struct task_struct* t){
-    
-}
-/*********************Slack handler functions - End* *************************/
-
 
 static int raise_system_criticality(void){
     int status = 0;

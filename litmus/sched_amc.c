@@ -1,8 +1,7 @@
 /*
  * litmus/sched_amc.c
- *
- * Implementation of fixed-priority adaptive mc scheduling with fixed non preemptible regions.
- * Modified pfp implementation.
+ *Implementation of Adaptive Mixed Criticality Scheduling Online component.
+ *Supporting implementation for AMC-max and AMC-rtb. 
  */
 
 #include <linux/percpu.h>

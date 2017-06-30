@@ -99,6 +99,14 @@ static  void __bheap_min(bheap_prio_t higher_prio, struct bheap* heap,
 	}
 }
 
+/*Get next parameter in bheap if condition is satisfied else return NULL.*/
+static void bheap_conditional_next(bheap_prio_t search_cond, struct bheap* heap,  struct bheap_node** node){
+    
+    *node = NULL;
+    if(search_cond(heap, heap->next))
+        *node = heap->next;
+}
+
 /*EDFVD: Iterate and clear an entire bheap data structure.
  * */
 void bheap_iterate_delete(bheap_prio_t higher_prio,struct bheap* heap)

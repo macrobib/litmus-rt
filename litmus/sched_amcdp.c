@@ -1,6 +1,9 @@
 /*
- * litmus/sched_zss.c
- * Implements online component to Zero Slack Scheduling approach.
+ *
+ * litmus/sched_amcdp.c
+ * Implementation of Adaptive Mixed Criticality Scheduling with support for Non 
+ * Preemptible region.
+ * Online component to AMC-DP approach.
  *
  */
 

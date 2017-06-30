@@ -59,7 +59,7 @@ void set_mc_status(const char* plugin_name){
     else{
         mc_enabled = 0;
     }
-    printk(KERN_WARNING"Litmus MC Status: %d\n", mc_enabled);
+    printk(KERN_DEBUG "Litmus MC Status: %d\n", mc_enabled);
 }
 
 /*EDF-VD: Wrapper accessor for period.*/
@@ -69,7 +69,7 @@ lt_t get_rt_period(struct task_struct* t){
      period = get_mc_rt_period(t);     
  }
  else{
-     printk(KERN_WARNING"Period non MC.\n");
+     printk(KERN_DEBUG "Period non MC.\n");
      period = _get_rt_period(t);
  }
  return period;
@@ -82,7 +82,7 @@ lt_t get_exec_cost(struct task_struct* t){
         cost = get_mc_exec_cost(t);
     }
     else{
-        printk(KERN_WARNING"Exec Cost non MC.\n");
+        printk(KERN_DEBUG "Exec Cost non MC.\n");
         cost = _get_exec_cost(t);
     }
     return cost;
@@ -95,7 +95,7 @@ lt_t get_rt_relative_deadline(struct task_struct* t){
         rel_deadline = get_mc_relative_deadline(t);
     }
     else{
-        printk(KERN_WARNING"Relative deadline non MC.\n");
+        printk(KERN_DEBUG "Relative deadline non MC.\n");
         rel_deadline = _get_rt_relative_deadline(t);
     }
     return rel_deadline;
@@ -219,21 +219,21 @@ asmlinkage long sys_set_rt_task_param(pid_t pid, struct rt_task __user * param)
 		       pid, tp.budget_policy);
 		goto out_unlock;
 	}
-    printk(KERN_WARNING"Basic error check completed.\n");
+    printk(KERN_DEBUG "Basic error check completed.\n");
 	if (is_realtime(target)) {
 		/* The task is already a real-time task.
 		 * Let plugin decide whether it wants to support
 		 * parameter changes at runtime.
 		 */
-        printk(KERN_DEBUG"Invoking task change params.\n");
+        printk(KERN_DEBUG "Invoking task change params.\n");
 		retval = litmus->task_change_params(target, &tp);
 	} else {
 		target->rt_param.task_params = tp;
 		retval = 0;
         index = 0;
-        printk(KERN_WARNING"Task criticality is: %llu\n", tp.mc_param.criticality);
+        printk(KERN_DEBUG "Task criticality is: %llu\n", tp.mc_param.criticality);
         while(index <= tp.mc_param.criticality){
-            printk(KERN_WARNING"PID:%d - Crit:%d - Budget:%llu - Period:%llu - Deadline:%llu\n",
+            printk(KERN_DEBUG "PID:%d - Crit:%d - Budget:%llu - Period:%llu - Deadline:%llu\n",
                     pid, index, tp.mc_param.budget[index], tp.mc_param.period[index], tp.mc_param.deadline[index]);
             ++index;
         }
@@ -405,7 +405,7 @@ asmlinkage long sys_reservation_destroy(unsigned int reservation_id, int cpu)
 
 asmlinkage long sys_set_system_criticality(lt_t __user crit){
     long ret = 0;
-    printk(KERN_WARNING"System criticality set to: %d\n", crit);
+    printk(KERN_DEBUG "System criticality set to: %d\n", crit);
     system_criticality = crit;
     return ret;
 } 
@@ -453,7 +453,7 @@ static long __litmus_admit_task(struct task_struct* tsk)
 	tsk_rt(tsk)->rel_heap = release_heap_alloc(GFP_ATOMIC);
 
 	if (!tsk_rt(tsk)->heap_node || !tsk_rt(tsk)->rel_heap) {
-		printk(KERN_WARNING "litmus: no more heap node memory!?\n");
+		printk(KERN_DEBUG "litmus: no more heap node memory!?\n");
 
 		return -ENOMEM;
 	} else {
@@ -462,14 +462,14 @@ static long __litmus_admit_task(struct task_struct* tsk)
 
 	preempt_disable();
 
+    printk(KERN_DEBUG "Admit task called..\n");
 	err = litmus->admit_task(tsk);
-
+    printk(KERN_DEBUG "Admit task returned: %ld\n", err);
 	if (!err) {
 		sched_trace_task_name(tsk);
 		sched_trace_task_param(tsk);
 		atomic_inc(&rt_task_count);
 	}
-
 	preempt_enable();
 
 	return err;
@@ -483,12 +483,12 @@ long litmus_admit_task(struct task_struct* tsk)
 
 	tsk_rt(tsk)->heap_node = NULL;
 	tsk_rt(tsk)->rel_heap = NULL;
-
+    printk(KERN_DEBUG "Litmus Admit task called..\n");
 	if (get_rt_relative_deadline(tsk) == 0 ||
 	    get_exec_cost(tsk) >
 			min(get_rt_relative_deadline(tsk), get_rt_period(tsk)) ) {
 
-        printk(KERN_WARNING"Litmus:- Invalid Task Parameters.\n");
+        printk(KERN_DEBUG "Litmus:- Invalid Task Parameters.\n");
 		TRACE_TASK(tsk,
 			"litmus admit: invalid task parameters "
 			"(e = %lu, p = %lu, d = %lu)\n",
@@ -605,7 +605,7 @@ int switch_sched_plugin(struct sched_plugin* plugin)
 {
 	int err;
 	struct domain_proc_info* domain_info;
-    printk(KERN_WARNING"Switching active plugin..\n");
+    printk(KERN_DEBUG "Switching active plugin..\n");
 	BUG_ON(!plugin);
 
 	if (atomic_read(&rt_task_count) == 0) {
