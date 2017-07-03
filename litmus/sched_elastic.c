@@ -105,9 +105,13 @@ static void elastic_calculate_init_slacks(void){
 
 }
 
-/*Update/Merge slack instances, remove expired slack instances.*/
+/* Update/Merge slack instances, remove expired slack instances.
+ * Updation step: For an idle instance check the first element in
+ * the release queue, insert a new slack task to queue. If the release
+ * task is runnable in given slack, pick and schedule.
+ * */
 static void update_slack_queue(void){
-
+    
 }
 
 /*Check if enough slack exists for an early release of new instance.*/
