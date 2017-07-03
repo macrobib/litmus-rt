@@ -1,8 +1,7 @@
 /*
- * litmus/sched_amc.c
+ * litmus/sched_pt-amc.c
+ * Implementation of AMC with preemption threshold.
  *
- * Implementation of fixed-priority adaptive mc scheduling with fixed non preemptible regions.
- * Modified pfp implementation.
  */
 
 #include <linux/percpu.h>
@@ -2065,7 +2064,7 @@ static long amc_deactivate_plugin(void)
 
 /*	Plugin object	*/
 static struct sched_plugin amc_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "AMC-FSNR",
+	.plugin_name		= "PT-AMC",
 	.task_new		= amc_task_new,
 	.complete_job		= complete_job,
 	.task_exit		= amc_task_exit,

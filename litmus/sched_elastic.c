@@ -1,5 +1,5 @@
 /*
- * kernel/sched_edfvd.c
+ * kernel/sched_elastic.c
  *
  */
 
@@ -21,7 +21,7 @@
 /* to set up domain/cpu mappings */
 #include <litmus/litmus_proc.h>
 #include <linux/module.h>
-/*EDFVD: added for hypercall invocation.*/
+/*ELASTIC: added for hypercall invocation.*/
 #ifdef ENABLE_MC_XEN
 #include <asm/xen/interface.h>
 #include <asm/xen/hypercall.h>
@@ -54,29 +54,28 @@ typedef struct {
  * protects the domain and serializes scheduling decisions
  */
 #define slock domain.ready_lock
-} edfvd_domain_t;
+} elastic_domain_t;
 
 typedef enum{
     eLOWER_CRIT,
     eRAISE_CRIT
 }crit_action_t;
-/*EDFVD Domain variable.*/
-edfvd_domain_t local_domain;
+/*ELASTIC Domain variable.*/
+elastic_domain_t local_domain;
 
-/*EDFVD: storage for the tasks removed from criticality change.*/
-static struct bheap edfvd_release_bin[MAX_CRITICALITY_LEVEL];
-
+/*ELASTIC: storage for the tasks removed from criticality change.*/
+static struct bheap elastic_release_bin[MAX_CRITICALITY_LEVEL];
 
 /************************  MC Params: End  ********************************/
 
-static void edfvd_domain_init(edfvd_domain_t* edfvd,
+static void elastic_domain_init(elastic_domain_t* elastic,
 			       check_resched_needed_t check,
 			       release_jobs_t release,
 			       int cpu)
 {
-	edf_domain_init(&edfvd->domain, check, release);
-	edfvd->cpu      		= cpu;
-	edfvd->scheduled		= NULL;
+	edf_domain_init(&elastic->domain, check, release);
+	elastic->cpu      		= cpu;
+	elastic->scheduled		= NULL;
 }
 
 /*********************Slack handler functions - Start*************************/
@@ -111,12 +110,11 @@ static void elastic_calculate_init_slacks(void){
  * task is runnable in given slack, pick and schedule.
  * */
 static void update_slack_queue(void){
-    
+
 }
 
 /*Check if enough slack exists for an early release of new instance.*/
 static void check_slack_availability(struct task_struct* t){
-    
 }
 /*********************Slack handler functions - End* *************************/
 
@@ -137,19 +135,19 @@ static int raise_system_criticality(void){
 
 static void lower_system_criticality(void){
     struct bheap* release_bin;
-    rt_domain_t* edfvd = &local_domain.domain;
+    rt_domain_t* elastic = &local_domain.domain;
 
     if(current_criticality > 0){
         current_criticality -= 1;
-        release_bin = &edfvd_release_bin[current_criticality];
-        update_release_heap(edfvd, release_bin, edf_ready_order, 1);
+        release_bin = &elastic_release_bin[current_criticality];
+        update_release_heap(elastic, release_bin, edf_ready_order, 1);
     }
     else{
        // TRACE("Bug: Tried to lower criticality below 0.\n");
     }
 }
 
-static int edfvd_check_criticality(struct bheap_node* node){
+static int elastic_check_criticality(struct bheap_node* node){
 
     struct task_struct* task = bheap2task(node);
     return (is_task_eligible(task));
@@ -158,7 +156,7 @@ static int edfvd_check_criticality(struct bheap_node* node){
 /*Add the low criticality task to appropriate release queue as 
  * per the current criticality.*/
 static void add_low_crit_to_wait_queue(struct task_struct* t){
-    struct bheap* release_bin = &edfvd_release_bin[current_criticality - 1];
+    struct bheap* release_bin = &elastic_release_bin[current_criticality - 1];
     bheap_insert( edf_ready_order, release_bin, tsk_rt(t)->heap_node);
 }
 
@@ -228,9 +226,9 @@ static void requeue(struct task_struct* t, rt_domain_t *edf)
 }
 
 /* we assume the lock is being held */
-static void preempt(edfvd_domain_t *edfvd)
+static void preempt(elastic_domain_t *elastic)
 {
-	preempt_if_preemptable(edfvd->scheduled, edfvd->cpu);
+	preempt_if_preemptable(elastic->scheduled, elastic->cpu);
 }
 
 #ifdef CONFIG_LITMUS_LOCKING
@@ -238,10 +236,10 @@ static void preempt(edfvd_domain_t *edfvd)
 static void boost_priority(struct task_struct* t)
 {
 	unsigned long		flags;
-	edfvd_domain_t* 	edfvd = &local_domain;
+	elastic_domain_t* 	elastic = &local_domain;
 	lt_t			now;
 
-	raw_spin_lock_irqsave(&edfvd->slock, flags);
+	raw_spin_lock_irqsave(&elastic->slock, flags);
 	now = litmus_clock();
 
 	TRACE_TASK(t, "priority boosted at %llu\n", now);
@@ -249,34 +247,34 @@ static void boost_priority(struct task_struct* t)
 	tsk_rt(t)->priority_boosted = 1;
 	tsk_rt(t)->boost_start_time = now;
 
-	if (edfvd->scheduled != t) {
+	if (elastic->scheduled != t) {
 		/* holder may be queued: first stop queue changes */
-		raw_spin_lock(&edfvd->domain.release_lock);
+		raw_spin_lock(&elastic->domain.release_lock);
 		if (is_queued(t) &&
 		    /* If it is queued, then we need to re-order. */
 		    bheap_decrease(edf_ready_order, tsk_rt(t)->heap_node) &&
 		    /* If we bubbled to the top, then we need to check for preemptions. */
-		    edf_preemption_needed(&edfvd->domain, edfvd->scheduled))
-				preempt(edfvd);
-		raw_spin_unlock(&edfvd->domain.release_lock);
+		    edf_preemption_needed(&elastic->domain, elastic->scheduled))
+				preempt(elastic);
+		raw_spin_unlock(&elastic->domain.release_lock);
 	} /* else: nothing to do since the job is not queued while scheduled */
 
-	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
+	raw_spin_unlock_irqrestore(&elastic->slock, flags);
 }
 
 static void unboost_priority(struct task_struct* t)
 {
 	unsigned long		flags;
-	edfvd_domain_t* 	edfvd = &local_domain;
+	elastic_domain_t* 	elastic = &local_domain;
 	lt_t			now;
 
-	raw_spin_lock_irqsave(&edfvd->slock, flags);
+	raw_spin_lock_irqsave(&elastic->slock, flags);
 	now = litmus_clock();
 
 	/* Assumption: this only happens when the job is scheduled.
 	 * Exception: If t transitioned to non-real-time mode, we no longer
 	 * care about it. */
-	BUG_ON(edfvd->scheduled != t && is_realtime(t));
+	BUG_ON(elastic->scheduled != t && is_realtime(t));
 
 	TRACE_TASK(t, "priority restored at %llu\n", now);
 
@@ -284,18 +282,18 @@ static void unboost_priority(struct task_struct* t)
 	tsk_rt(t)->boost_start_time = 0;
 
 	/* check if this changes anything */
-	if (edf_preemption_needed(&edfvd->domain, edfvd->scheduled))
-		preempt(edfvd);
+	if (edf_preemption_needed(&elastic->domain, elastic->scheduled))
+		preempt(elastic);
 
-	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
+	raw_spin_unlock_irqrestore(&elastic->slock, flags);
 }
 
 #endif
 
-static int edfvd_preempt_check(edfvd_domain_t *edfvd)
+static int elastic_preempt_check(elastic_domain_t *elastic)
 {
-	if (edf_preemption_needed(&edfvd->domain, edfvd->scheduled)) {
-		preempt(edfvd);
+	if (edf_preemption_needed(&elastic->domain, elastic->scheduled)) {
+		preempt(elastic);
 		return 1;
 	} else
 		return 0;
@@ -304,14 +302,14 @@ static int edfvd_preempt_check(edfvd_domain_t *edfvd)
 /* This check is trivial in partioned systems as we only have to consider
  * the CPU of the partition.
  */
-static int edfvd_check_resched(rt_domain_t *edf)
+static int elastic_check_resched(rt_domain_t *edf)
 {
-	edfvd_domain_t *edfvd = container_of(edf, edfvd_domain_t, domain);
+	elastic_domain_t *elastic = container_of(edf, elastic_domain_t, domain);
 
 	/* because this is a callback from rt_domain_t we already hold
 	 * the necessary lock for the ready queue
 	 */
-	return edfvd_preempt_check(edfvd);
+	return elastic_preempt_check(elastic);
 }
 
 static void job_completion(struct task_struct* t, int forced)
@@ -323,33 +321,33 @@ static void job_completion(struct task_struct* t, int forced)
 	prepare_for_next_period(t);
 }
 
-static struct task_struct* edfvd_schedule(struct task_struct * prev)
+static struct task_struct* elastic_schedule(struct task_struct * prev)
 {
-	edfvd_domain_t* 	edfvd = &local_domain;
-	rt_domain_t*		edf  = &edfvd->domain;
+	elastic_domain_t* 	elastic = &local_domain;
+	rt_domain_t*		edf  = &elastic->domain;
 	struct task_struct*	next;
     
 	int 			out_of_time, sleep, preempt,
 				np, exists, blocks, resched;
    
-	raw_spin_lock(&edfvd->slock);
+	raw_spin_lock(&elastic->slock);
 	/* sanity checking
 	 * differently from gedf, when a task exits (dead)
-	 * edfvd->schedule may be null and prev _is_ realtime
+	 * elastic->schedule may be null and prev _is_ realtime
 	 */
-	BUG_ON(edfvd->scheduled && edfvd->scheduled != prev);
-	BUG_ON(edfvd->scheduled && !is_realtime(prev));
+	BUG_ON(elastic->scheduled && elastic->scheduled != prev);
+	BUG_ON(elastic->scheduled && !is_realtime(prev));
     
 	/* (0) Determine state */
-	exists      = edfvd->scheduled != NULL;
+	exists      = elastic->scheduled != NULL;
 	blocks      = exists && !is_current_running();
-	out_of_time = exists && budget_enforced(edfvd->scheduled)
-			     && budget_exhausted(edfvd->scheduled);
-	np 	    = exists && is_np(edfvd->scheduled);
-	sleep	    = exists && is_completed(edfvd->scheduled);
+	out_of_time = exists && budget_enforced(elastic->scheduled)
+			     && budget_exhausted(elastic->scheduled);
+	np 	    = exists && is_np(elastic->scheduled);
+	sleep	    = exists && is_completed(elastic->scheduled);
 	preempt     = edf_preemption_needed(edf, prev);
 
-    if(exists && !budget_precisely_enforced(edfvd->scheduled))
+    if(exists && !budget_precisely_enforced(elastic->scheduled))
         BUG_ON(exists);
 	/* If we need to preempt do so.
 	 * The following checks set resched to 1 in case of special
@@ -364,17 +362,17 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
             BUG_ON(!exists);
             /*Budget overrun occurred, raise system criticality.*/
             /*Change criticality only for a high crit overrun.*/
-            if(is_task_high_crit(edfvd->scheduled)){
+            if(is_task_high_crit(elastic->scheduled)){
                 printk(KERN_WARNING"Budget Overrun occurred..\n");
                 if(raise_system_criticality()){
 
                     /**Update task control page to notify user space
                      * of the change in criticality.**/
-                    if(has_control_page(edfvd->scheduled)){
-                        struct control_page* cp  = get_control_page(edfvd->scheduled);
+                    if(has_control_page(elastic->scheduled)){
+                        struct control_page* cp  = get_control_page(elastic->scheduled);
                         cp->active_crit = current_criticality;
                     }
-                    if(replenish_task_for_mode(edfvd->scheduled, eRAISE_CRIT)){
+                    if(replenish_task_for_mode(elastic->scheduled, eRAISE_CRIT)){
                         resched = 0;
                         exists = 1;
                     }
@@ -386,20 +384,20 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
                 }
                 else{
                     /*System criticality ceiling reached, mark and reschedule.*/
-                    job_completion(edfvd->scheduled, !sleep);
+                    job_completion(elastic->scheduled, !sleep);
                     resched = 1;
                 }
             }
             else{
                 /*Overrun task is low crit, mark completed and recshedule.*/
                 printk(KERN_WARNING"Low crit budget overrun..\n");
-                job_completion(edfvd->scheduled, !sleep);
+                job_completion(elastic->scheduled, !sleep);
                 resched = 1;
                }
        }
         /*Condition 2: Handle task completion.*/
        else if(sleep){
-            job_completion(edfvd->scheduled, !sleep);
+            job_completion(elastic->scheduled, !sleep);
 		    resched = 1;
        } 
        else{
@@ -429,7 +427,7 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
 	 * Multiple calls to request_exit_np() don't hurt.
 	 */
 	if (np && (out_of_time || preempt || sleep)){
-		request_exit_np(edfvd->scheduled);
+		request_exit_np(elastic->scheduled);
         BUG_ON(1);
         }
     
@@ -447,12 +445,12 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
         if(exists)
         if (exists && !blocks){
             /*Handle scheduled task for preemption.*/
-            if(is_task_eligible(edfvd->scheduled)){
+            if(is_task_eligible(elastic->scheduled)){
                 /*If completed task is eligible, then requeue, else store.*/
-			        requeue(edfvd->scheduled, edf);
+			        requeue(elastic->scheduled, edf);
                 }
                 else{
-                    add_low_crit_to_wait_queue(edfvd->scheduled);
+                    add_low_crit_to_wait_queue(elastic->scheduled);
                 }
             }
         /*Pick next ready task.*/
@@ -484,22 +482,22 @@ static struct task_struct* edfvd_schedule(struct task_struct * prev)
         printk(KERN_ERR"Budget Exiting..\n");
         printk(KERN_ERR"Execution cost: %llu\n", get_exec_cost(next));
         printk(KERN_ERR"Execution time: %llu\n", get_exec_time(next));
-        if(next == edfvd->scheduled)
+        if(next == elastic->scheduled)
             BUG_ON(budget_exhausted(next));
     }**/
-	edfvd->scheduled = next;
+	elastic->scheduled = next;
 	sched_state_task_picked();
-	raw_spin_unlock(&edfvd->slock);
+	raw_spin_unlock(&elastic->slock);
 	return next;
 }
 
 
 /*	Prepare a task for running in RT mode
  */
-static void edfvd_task_new(struct task_struct * t, int on_rq, int is_scheduled)
+static void elastic_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 {
 	rt_domain_t* 		edf  = &local_domain.domain;
-	edfvd_domain_t* 	edfvd = &local_domain;
+	elastic_domain_t* 	elastic = &local_domain;
 	unsigned long		flags;
 
 	TRACE_TASK(t, "psn edf: task new, cpu = %d\n",
@@ -512,12 +510,12 @@ static void edfvd_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 	/* The task should be running in the queue, otherwise signal
 	 * code will try to wake it up with fatal consequences.
 	 */
-	raw_spin_lock_irqsave(&edfvd->slock, flags);
+	raw_spin_lock_irqsave(&elastic->slock, flags);
 	if (is_scheduled) {
 		/* there shouldn't be anything else scheduled at the time */
-		BUG_ON(edfvd->scheduled);
+		BUG_ON(elastic->scheduled);
         TRACE("New task scheduled..\n");
-		edfvd->scheduled = t;
+		elastic->scheduled = t;
 	} else {
 		/* !is_scheduled means it is not scheduled right now, but it
 		 * does not mean that it is suspended. If it is not suspended,
@@ -527,21 +525,21 @@ static void edfvd_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 		if (on_rq) {
 			requeue(t, edf);
 			/* maybe we have to reschedule */
-			edfvd_preempt_check(edfvd);
+			elastic_preempt_check(elastic);
 		}
 	}
-	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
+	raw_spin_unlock_irqrestore(&elastic->slock, flags);
 }
 
-static void edfvd_task_wake_up(struct task_struct *task)
+static void elastic_task_wake_up(struct task_struct *task)
 {
 	unsigned long		flags;
-	edfvd_domain_t* 	edfvd = &local_domain;
+	elastic_domain_t* 	elastic = &local_domain;
 	rt_domain_t* 		edf  = &local_domain.domain;
 	lt_t			now;
     printk(KERN_WARNING"Wakeup the new task..\n");
 	TRACE_TASK(task, "wake_up at %llu\n", litmus_clock());
-	raw_spin_lock_irqsave(&edfvd->slock, flags);
+	raw_spin_lock_irqsave(&elastic->slock, flags);
 	BUG_ON(is_queued(task));
 	now = litmus_clock();
 	if (is_sporadic(task) && is_tardy(task, now)
@@ -562,25 +560,25 @@ static void edfvd_task_wake_up(struct task_struct *task)
 	 * de-scheduling the task, i.e., wake_up() raced with schedule()
 	 * and won.
 	 */
-	if (edfvd->scheduled != task) {
+	if (elastic->scheduled != task) {
         /*If the waken task is not eligible on current crit, move to 
          * waiting release queue.
          * */
-        if(edfvd->scheduled == NULL)
+        if(elastic->scheduled == NULL)
             printk(KERN_WARNING"No previous scheduled task..\n");
         //release_at(task, litmus_clock());
         printk(KERN_WARNING"Woken up task not same as current..: Requeued\n");
 		requeue(task, edf);
-		if(!edfvd_preempt_check(edfvd)){
+		if(!elastic_preempt_check(elastic)){
             printk(KERN_WARNING"No preemption done..\n");
         }
 	}
 
-	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
+	raw_spin_unlock_irqrestore(&elastic->slock, flags);
 	TRACE_TASK(task, "wake up done\n");
 }
 
-static void edfvd_task_block(struct task_struct *t)
+static void elastic_task_block(struct task_struct *t)
 {
 	/* only running tasks can block, thus t is in no queue */
 	TRACE_TASK(t, "block at %llu, state=%d\n", litmus_clock(), t->state);
@@ -589,25 +587,25 @@ static void edfvd_task_block(struct task_struct *t)
 	BUG_ON(is_queued(t));
 }
 
-static void edfvd_task_exit(struct task_struct * t)
+static void elastic_task_exit(struct task_struct * t)
 {
 	unsigned long flags;
-	edfvd_domain_t* 	edfvd = &local_domain;
+	elastic_domain_t* 	elastic = &local_domain;
 	rt_domain_t*		edf;
 
-	raw_spin_lock_irqsave(&edfvd->slock, flags);
+	raw_spin_lock_irqsave(&elastic->slock, flags);
 	if (is_queued(t)) {
 		/* dequeue */
 		edf  = &local_domain.domain;
 		remove(edf, t);
 	}
-	if (edfvd->scheduled == t)
-		edfvd->scheduled = NULL;
+	if (elastic->scheduled == t)
+		elastic->scheduled = NULL;
 
 	TRACE_TASK(t, "RIP, now reschedule\n");
 
-	preempt(edfvd);
-	raw_spin_unlock_irqrestore(&edfvd->slock, flags);
+	preempt(elastic);
+	raw_spin_unlock_irqrestore(&elastic->slock, flags);
 }
 
 #ifdef CONFIG_LITMUS_LOCKING
@@ -617,7 +615,7 @@ static void edfvd_task_exit(struct task_struct * t)
 
 /* ******************** SRP support ************************ */
 
-static unsigned int edfvd_get_srp_prio(struct task_struct* t)
+static unsigned int elastic_get_srp_prio(struct task_struct* t)
 {
 	return get_rt_relative_deadline(t);
 }
@@ -639,7 +637,7 @@ static inline struct fmlp_semaphore* fmlp_from_lock(struct litmus_lock* lock)
 {
 	return container_of(lock, struct fmlp_semaphore, litmus_lock);
 }
-int edfvd_fmlp_lock(struct litmus_lock* l)
+int elastic_fmlp_lock(struct litmus_lock* l)
 {
 	struct task_struct* t = current;
 	struct fmlp_semaphore *sem = fmlp_from_lock(l);
@@ -699,7 +697,7 @@ int edfvd_fmlp_lock(struct litmus_lock* l)
 	return 0;
 }
 
-int edfvd_fmlp_unlock(struct litmus_lock* l)
+int elastic_fmlp_unlock(struct litmus_lock* l)
 {
 	struct task_struct *t = current, *next;
 	struct fmlp_semaphore *sem = fmlp_from_lock(l);
@@ -739,7 +737,7 @@ out:
 	return err;
 }
 
-int edfvd_fmlp_close(struct litmus_lock* l)
+int elastic_fmlp_close(struct litmus_lock* l)
 {
 	struct task_struct *t = current;
 	struct fmlp_semaphore *sem = fmlp_from_lock(l);
@@ -754,24 +752,24 @@ int edfvd_fmlp_close(struct litmus_lock* l)
 	spin_unlock_irqrestore(&sem->wait.lock, flags);
 
 	if (owner)
-		edfvd_fmlp_unlock(l);
+		elastic_fmlp_unlock(l);
 
 	return 0;
 }
 
-void edfvd_fmlp_free(struct litmus_lock* lock)
+void elastic_fmlp_free(struct litmus_lock* lock)
 {
 	kfree(fmlp_from_lock(lock));
 }
 
-static struct litmus_lock_ops edfvd_fmlp_lock_ops = {
-	.close  = edfvd_fmlp_close,
-	.lock   = edfvd_fmlp_lock,
-	.unlock = edfvd_fmlp_unlock,
-	.deallocate = edfvd_fmlp_free,
+static struct litmus_lock_ops elastic_fmlp_lock_ops = {
+	.close  = elastic_fmlp_close,
+	.lock   = elastic_fmlp_lock,
+	.unlock = elastic_fmlp_unlock,
+	.deallocate = elastic_fmlp_free,
 };
 
-static struct litmus_lock* edfvd_new_fmlp(void)
+static struct litmus_lock* elastic_new_fmlp(void)
 {
 	struct fmlp_semaphore* sem;
 
@@ -781,7 +779,7 @@ static struct litmus_lock* edfvd_new_fmlp(void)
 
 	sem->owner   = NULL;
 	init_waitqueue_head(&sem->wait);
-	sem->litmus_lock.ops = &edfvd_fmlp_lock_ops;
+	sem->litmus_lock.ops = &elastic_fmlp_lock_ops;
 
 	return &sem->litmus_lock;
 }
@@ -789,7 +787,7 @@ static struct litmus_lock* edfvd_new_fmlp(void)
 /* **** lock constructor **** */
 
 
-static long edfvd_allocate_lock(struct litmus_lock **lock, int type,
+static long elastic_allocate_lock(struct litmus_lock **lock, int type,
 				 void* __user unused)
 {
 	int err = -ENXIO;
@@ -800,7 +798,7 @@ static long edfvd_allocate_lock(struct litmus_lock **lock, int type,
 	switch (type) {
 	case FMLP_SEM:
 		/* Flexible Multiprocessor Locking Protocol */
-		*lock = edfvd_new_fmlp();
+		*lock = elastic_new_fmlp();
 		if (*lock)
 			err = 0;
 		else
@@ -823,14 +821,14 @@ static long edfvd_allocate_lock(struct litmus_lock **lock, int type,
 
 #endif
 
-static struct domain_proc_info edfvd_domain_proc_info;
-static long edfvd_get_domain_proc_info(struct domain_proc_info **ret)
+static struct domain_proc_info elastic_domain_proc_info;
+static long elastic_get_domain_proc_info(struct domain_proc_info **ret)
 {
-	*ret = &edfvd_domain_proc_info;
+	*ret = &elastic_domain_proc_info;
 	return 0;
 }
 
-static void edfvd_setup_domain_proc(void)
+static void elastic_setup_domain_proc(void)
 {
 	int i, cpu;
 	int release_master =
@@ -842,16 +840,16 @@ static void edfvd_setup_domain_proc(void)
 	int num_rt_cpus = num_online_cpus() - (release_master != NO_CPU);
 	struct cd_mapping *cpu_map, *domain_map;
 
-	memset(&edfvd_domain_proc_info, 0, sizeof(edfvd_domain_proc_info));
-	init_domain_proc_info(&edfvd_domain_proc_info, num_rt_cpus, num_rt_cpus);
-	edfvd_domain_proc_info.num_cpus = num_rt_cpus;
-	edfvd_domain_proc_info.num_domains = num_rt_cpus;
+	memset(&elastic_domain_proc_info, 0, sizeof(elastic_domain_proc_info));
+	init_domain_proc_info(&elastic_domain_proc_info, num_rt_cpus, num_rt_cpus);
+	elastic_domain_proc_info.num_cpus = num_rt_cpus;
+	elastic_domain_proc_info.num_domains = num_rt_cpus;
 
 	for (cpu = 0, i = 0; cpu < num_online_cpus(); ++cpu) {
 		if (cpu == release_master)
 			continue;
-		cpu_map = &edfvd_domain_proc_info.cpu_to_domains[i];
-		domain_map = &edfvd_domain_proc_info.domain_to_cpus[i];
+		cpu_map = &elastic_domain_proc_info.cpu_to_domains[i];
+		domain_map = &elastic_domain_proc_info.domain_to_cpus[i];
 
 		cpu_map->id = cpu;
 		domain_map->id = i; /* enumerate w/o counting the release master */
@@ -861,7 +859,7 @@ static void edfvd_setup_domain_proc(void)
 	}
 }
 
-static long edfvd_activate_plugin(void)
+static long elastic_activate_plugin(void)
 {
 #ifdef CONFIG_RELEASE_MASTER
 	int cpu;
@@ -872,21 +870,21 @@ static long edfvd_activate_plugin(void)
 #endif
 
 #ifdef CONFIG_LITMUS_LOCKING
-	get_srp_prio = edfvd_get_srp_prio;
+	get_srp_prio = elastic_get_srp_prio;
 #endif
 
-	edfvd_setup_domain_proc();
+	elastic_setup_domain_proc();
 
 	return 0;
 }
 
-static long edfvd_deactivate_plugin(void)
+static long elastic_deactivate_plugin(void)
 {
-	destroy_domain_proc_info(&edfvd_domain_proc_info);
+	destroy_domain_proc_info(&elastic_domain_proc_info);
 	return 0;
 }
 
-static long edfvd_admit_task(struct task_struct* tsk)
+static long elastic_admit_task(struct task_struct* tsk)
 {
 	if (task_cpu(tsk) == tsk->rt_param.task_params.cpu
 #ifdef CONFIG_RELEASE_MASTER
@@ -901,30 +899,30 @@ static long edfvd_admit_task(struct task_struct* tsk)
 
 /*	Plugin object	*/
 static struct sched_plugin psn_edf_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "EDFVD",
-	.task_new		= edfvd_task_new,
+	.plugin_name		= "ELASTIC",
+	.task_new		= elastic_task_new,
 	.complete_job		= complete_job,
-	.task_exit		= edfvd_task_exit,
-	.schedule		= edfvd_schedule,
-	.task_wake_up		= edfvd_task_wake_up,
-	.task_block		= edfvd_task_block,
-	.admit_task		= edfvd_admit_task,
-	.activate_plugin	= edfvd_activate_plugin,
-	.deactivate_plugin	= edfvd_deactivate_plugin,
-	.get_domain_proc_info	= edfvd_get_domain_proc_info,
+	.task_exit		= elastic_task_exit,
+	.schedule		= elastic_schedule,
+	.task_wake_up		= elastic_task_wake_up,
+	.task_block		= elastic_task_block,
+	.admit_task		= elastic_admit_task,
+	.activate_plugin	= elastic_activate_plugin,
+	.deactivate_plugin	= elastic_deactivate_plugin,
+	.get_domain_proc_info	= elastic_get_domain_proc_info,
 #ifdef CONFIG_LITMUS_LOCKING
-	.allocate_lock		= edfvd_allocate_lock,
+	.allocate_lock		= elastic_allocate_lock,
 #endif
 };
 
 
-static int __init init_edfvd(void)
+static int __init init_elastic(void)
 {
     /*Register the schedule domain, still using vestige of pedf scheduler.*/
         current_criticality = 0; /*Reinitializing for plugin switches.*/
-		edfvd_domain_init(&local_domain,
-				   edfvd_check_resched,NULL, 0);
+		elastic_domain_init(&local_domain,
+				   elastic_check_resched,NULL, 0);
 	return register_sched_plugin(&psn_edf_plugin);
 }
 
-module_init(init_edfvd);
+module_init(init_elastic);
