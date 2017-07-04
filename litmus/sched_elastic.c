@@ -85,8 +85,8 @@ static enum hrtimer_restart on_slack_timeout(struct hrtimer* timer){
                                     timer);
     unsigned long flags;
     local_irq_save(flags);
-    et->armed = 0;
-    slack_state = 0;
+    et->armed = 0; /*Slack timer disabled.*/
+    slack_state = 0; /*System no longer in slack usage state.*/
     litmus_local_reschedule();
     local_irq_restore(flags);
     return HRTIMER_NORESTART;
