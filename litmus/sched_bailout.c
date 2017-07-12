@@ -269,10 +269,12 @@ static struct task_struct* pfp_schedule(struct task_struct * prev)
 	struct task_struct*	next;
 
 	int out_of_time, sleep, preempt, np, exists, blocks, resched, migrate;
+
 #ifdef BAILOUT_PROTO
 	int hi_critical, service_time_ms, c_lo_ms, c_hi_ms, id, prio;
 	lt_t service_time, c_lo, c_hi, overhead;
 #endif
+
 	raw_spin_lock(&pfp->slock);
 
 	/* sanity checking
@@ -285,6 +287,7 @@ static struct task_struct* pfp_schedule(struct task_struct * prev)
 	/* (0) Determine state */
 	exists      = pfp->scheduled != NULL;
 	blocks      = exists && !is_running(pfp->scheduled);
+
 #ifdef BAILOUT_PROTO
 	overhead 	= litmus_clock();
 	id		= (!exists) ? 0 : pfp->scheduled->pid;
@@ -303,6 +306,7 @@ static struct task_struct* pfp_schedule(struct task_struct * prev)
 	overhead = litmus_clock() - overhead - CLK_OVERHEAD;
 	TRACE("bailout_overhead : %llu\n",overhead);
 #endif
+
 	out_of_time = exists &&
 				  budget_enforced(pfp->scheduled) &&
 				  budget_exhausted(pfp->scheduled);

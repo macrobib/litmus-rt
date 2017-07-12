@@ -24,8 +24,9 @@
 /* to set up domain/cpu mappings */
 #include <litmus/litmus_proc.h>
 #include <linux/uaccess.h>
-#define TOTAL_SKIP_COUNT 32 /*Limit to contrained tasks.*/
 
+#define TOTAL_SKIP_COUNT 32 /*Limit to contrained tasks.*/
+#define BOOSTED (1) /*mark to user space of task criticality being boosted.*/
 typedef struct {
 	rt_domain_t 		domain;
 	struct fp_prio_queue	ready_queue;
@@ -59,6 +60,14 @@ DEFINE_PER_CPU(uint64_t,fmlp_timestamp);
 #endif
 
 /**********************ICG Helper functions.********************************/
+
+static inline void icg_update_control_page(struct task_struct* t, int flag){
+    if(has_control_page(t)){
+        struct control_page* cp = get_control_page(t);
+        cp->active_crit = flag;
+    }
+}
+
 /*Mark all the constrained tasks for given task with the new mask.
  *Returns total number of tasks marked.
  * */
@@ -66,25 +75,19 @@ static int icg_mark_overridden_tasks(struct task_struct* t, int mask){
     int count;
     int index;
     int mask = tsk_rt(t)->task_params.mc_param.mask;
-
-    if (mask){
-        for(int i = 0; i < TOTAL_SKIP_COUNT; i++){
-            if(mask & (1 << i)){
-                count++;
-                constrained_indexed_tasks[i]->skip = 1;
-            }
+    
+    for(int i = 0; i < TOTAL_SKIP_COUNT; i++){
+        if(mask & (1 << i)){
+            count++;
+            constrained_indexed_tasks[i]->skip = mask;
         }
     }
-    else{
-        for(int i = 0; i < TOTAL_SKIP_COUNT; i++){
-            if(mask & (1 << i)){
-                count++;
-                constrained_indexed_tasks[i]->skip = 0;
-            }
-        }
-    }
+    if(count)
+        icg_update_control_page(t, flag);/*user space update.*/
     return count;
 }
+
+
 
 /*Replenish task for a mode change, return 1 if task has budget in new mode.*/
 static int icg_replenish_task_for_mode(struct task_struct* t, int mode){
@@ -149,7 +152,6 @@ static void icg_release_jobs(rt_domain_t* rt, struct bheap* tasks)
             requeue(t);;
         }
 	}
-
 	/* do we need to preempt? */
 	if (fp_higher_prio(fp_prio_peek(&icg->ready_queue), icg->scheduled)) {
 		TRACE_CUR("preempted by new release\n");
@@ -185,7 +187,8 @@ static void job_completion(struct task_struct* t, int forced)
 {
 	sched_trace_task_completion(t, forced);
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
-
+    /*Task has completed reenable the masked tasks if any.*/
+    icg_mark_overridden_tasks(t, 0);
 	tsk_rt(t)->completed = 0;
 	prepare_for_next_period(t);
 	if (is_released(t, litmus_clock()))
@@ -204,7 +207,7 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 	icg_domain_t* 	icg = &icg_domain;
 	struct task_struct*	next;
     struct task_struct* scheduled = icg->scheduled;
-	int out_of_time, sleep, preempt, np, exists, blocks, resched, migrate;
+	int out_of_time, sleep, preempt, np, exists, blocks, resched;
 
 	raw_spin_lock(&icg->slock);
 
@@ -222,8 +225,7 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 	                     && budget_exhausted(icg->scheduled);
 	np 	    = exists && is_np(icg->scheduled);
 	sleep	    = exists && is_completed(icg->scheduled);
-	migrate     = exists && get_partition(icg->scheduled) != icg->cpu;
-	preempt     = !blocks && (migrate || fp_preemption_needed(&icg->ready_queue, prev));
+	preempt     = !blocks && (fp_preemption_needed(&icg->ready_queue, prev));
 
     if(exists && !budget_precisely_enforced(icg->scheduled))
         BUG_ON(exists);
@@ -249,15 +251,10 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
             }
         }
     }
-    else if(is_completed(scheduled)){
+    else if(sleep){
         /*Once task has completed execution, uncheck any marked tasks.*/
         job_completion(scheduled, !sleep);
         icg_mark_overridden_tasks(scheduled, 0);
-        resched = 1;
-    }
-    else if(sleep){
-        /*Task went to sleep, mark for completion, and unmark constrained tasks.*/
-        job_completion(scheduled, !sleep);
         resched = 1;
     }
     else{
@@ -297,14 +294,14 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 		 * release queue (if it completed). requeue() picks
 		 * the appropriate queue.
 		 */
-		if (icg->scheduled && !blocks  && !migrate)
+		if (icg->scheduled && !blocks)
 			requeue(icg->scheduled, icg);
 		next = fp_prio_take(&icg->ready_queue);
 		if (next == prev) {
 			struct task_struct *t = fp_prio_peek(&icg->ready_queue);
-			TRACE_TASK(next, "next==prev sleep=%d oot=%d np=%d preempt=%d migrate=%d "
+			TRACE_TASK(next, "next==prev sleep=%d oot=%d np=%d preempt=%d "
 				   "boost=%d empty=%d prio-idx=%u prio=%u\n",
-				   sleep, out_of_time, np, preempt, migrate,
+				   sleep, out_of_time, np, preempt, 
 				   is_priority_boosted(next),
 				   t == NULL,
 				   priority_index(next),
@@ -319,7 +316,7 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 		BUG_ON(preempt && next == prev);
 		/* Similarly, if preempt is set, then next may not be NULL,
 		 * unless it's a migration. */
-		BUG_ON(preempt && !migrate && next == NULL);
+		BUG_ON(preempt && next == NULL);
 	} else
 		/* Only override Linux scheduler if we have a real-time task
 		 * scheduled that needs to continue.
@@ -416,13 +413,6 @@ static void icg_task_wake_up(struct task_struct *task)
 #endif
 	now = litmus_clock();
 	if (is_sporadic(task) && is_tardy(task, now)
-#ifdef CONFIG_LITMUS_LOCKING
-	/* We need to take suspensions because of semaphores into
-	 * account! If a job resumes after being suspended due to acquiring
-	 * a semaphore, it should never be treated as a new job release.
-	 */
-	    && !is_priority_boosted(task)
-#endif
 		) {
 		inferred_sporadic_job_release_at(task, now);
 	}

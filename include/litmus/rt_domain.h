@@ -47,6 +47,14 @@ typedef struct _rt_domain {
 	bheap_prio_t			order;
 } rt_domain_t;
 
+#ifdef CONFIG_AMC_DP
+typedef struct _defer_prop{
+    long dp; /*active defer preemption point(abs value).*/
+    struct task_struct* t;
+    bheap_node* dp_node;
+} defer_prop_t;
+#endif
+
 struct release_heap {
 	/* list_head for per-time-slot list */
 	struct list_head		list;

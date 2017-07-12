@@ -36,7 +36,7 @@ typedef struct {
  */
 #define slock domain.ready_lock
 
-} amc_domain_t;
+} zss_domain_t;
 
 /*AMC:
  * Store the tasks dropped from the release queue and runqueue respectively.
@@ -47,15 +47,15 @@ typedef struct {
 bheap release_queue_bin;
 bheap runqueue_bin;
 
-DEFINE_PER_CPU(amc_domain_t, amc_domains);
+DEFINE_PER_CPU(zss_domain_t, zss_domains);
 
-amc_domain_t* amc_doms[NR_CPUS];
+zss_domain_t* zss_doms[NR_CPUS];
 
-#define local_amc		(this_cpu_ptr(&amc_domains))
-#define remote_dom(cpu)		(&per_cpu(amc_domains, cpu).domain)
-#define remote_amc(cpu)	(&per_cpu(amc_domains, cpu))
+#define local_zss		(this_cpu_ptr(&zss_domains))
+#define remote_dom(cpu)		(&per_cpu(zss_domains, cpu).domain)
+#define remote_zss(cpu)	(&per_cpu(zss_domains, cpu))
 #define task_dom(task)		remote_dom(get_partition(task))
-#define task_amc(task)		remote_amc(get_partition(task))
+#define task_zss(task)		remote_zss(get_partition(task))
 
 
 #ifdef CONFIG_LITMUS_LOCKING
@@ -63,9 +63,9 @@ DEFINE_PER_CPU(uint64_t,fmlp_timestamp);
 #endif
 
 /* we assume the lock is being held */
-static void preempt(amc_domain_t *amc)
+static void preempt(zss_domain_t *zss)
 {
-	preempt_if_preemptable(amc->scheduled, amc->cpu);
+	preempt_if_preemptable(zss->scheduled, zss->cpu);
 }
 
 static unsigned int priority_index(struct task_struct* t)
@@ -83,14 +83,14 @@ static unsigned int priority_index(struct task_struct* t)
 		return get_priority(t);
 }
 
-static void amc_release_jobs(rt_domain_t* rt, struct bheap* tasks)
+static void zss_release_jobs(rt_domain_t* rt, struct bheap* tasks)
 {
-	amc_domain_t *amc = container_of(rt, amc_domain_t, domain);
+	zss_domain_t *zss = container_of(rt, zss_domain_t, domain);
 	unsigned long flags;
 	struct task_struct* t;
 	struct bheap_node* hn;
 
-	raw_spin_lock_irqsave(&amc->slock, flags);
+	raw_spin_lock_irqsave(&zss->slock, flags);
 
 	while (!bheap_empty(tasks)) {
 		hn = bheap_take(fp_ready_order, tasks);
@@ -99,41 +99,41 @@ static void amc_release_jobs(rt_domain_t* rt, struct bheap* tasks)
         if(is_task_eligible(t)){
     		TRACE_TASK(t, "released (part:%d prio:%d)\n",
 	    		   get_partition(t), get_priority(t));
-		    fp_prio_add(&amc->ready_queue, t, priority_index(t));
+		    fp_prio_add(&zss->ready_queue, t, priority_index(t));
         }
     }
 
 	/* do we need to preempt? */
-	if (fp_higher_prio(fp_prio_peek(&amc->ready_queue), amc->scheduled)) {
+	if (fp_higher_prio(fp_prio_peek(&zss->ready_queue), zss->scheduled)) {
 		TRACE_CUR("preempted by new release\n");
-		preempt(amc);
+		preempt(zss);
 	}
 
-	raw_spin_unlock_irqrestore(&amc->slock, flags);
+	raw_spin_unlock_irqrestore(&zss->slock, flags);
 }
 
-static void amc_preempt_check(amc_domain_t *amc)
+static void zss_preempt_check(zss_domain_t *zss)
 {
-	if (fp_higher_prio(fp_prio_peek(&amc->ready_queue), amc->scheduled))
-		preempt(amc);
+	if (fp_higher_prio(fp_prio_peek(&zss->ready_queue), zss->scheduled))
+		preempt(zss);
 }
 
-static void amc_domain_init(amc_domain_t* amc,
+static void zss_domain_init(zss_domain_t* zss,
 			       int cpu)
 {
-	fp_domain_init(&amc->domain, NULL, amc_release_jobs);
-	amc->cpu      		= cpu;
-	amc->scheduled		= NULL;
-	fp_prio_queue_init(&amc->ready_queue);
+	fp_domain_init(&zss->domain, NULL, zss_release_jobs);
+	zss->cpu      		= cpu;
+	zss->scheduled		= NULL;
+	fp_prio_queue_init(&zss->ready_queue);
 }
 
-static void requeue(struct task_struct* t, amc_domain_t *amc)
+static void requeue(struct task_struct* t, zss_domain_t *zss)
 {
 	tsk_rt(t)->completed = 0;
 	if (is_released(t, litmus_clock()))
-		fp_prio_add(&amc->ready_queue, t, priority_index(t));
+		fp_prio_add(&zss->ready_queue, t, priority_index(t));
 	else
-		add_release(&amc->domain, t); /* it has got to wait */
+		add_release(&zss->domain, t); /* it has got to wait */
 }
 
 static void job_completion(struct task_struct* t, int forced)
@@ -151,18 +151,17 @@ static void job_completion(struct task_struct* t, int forced)
  * allowed to continue even if they were released before
  * criticality change, remove them from the release queue
  * to a temporary queue to be moved back when returning back
- * to prev criticalitystatic void update_release_queue(){
-
-    clear_release_heap(&local_amc->domain, &release_queue_bin, amc_check_criticality, fp_ready_order);
+ * to prev criticality*/
+static void update_release_queue(){
+    clear_release_heap(&local_zss->domain, &release_queue_bin, zss_check_criticality, fp_ready_order);
     TRACE_CUR("Updated the release queue for the current criticality.");
-
 }
 
 /*AMC: Update runqueue for current criticality similar to release queue.*/
 static void update_runqueue(){
     
-    bheap_iterate_clear(amc_check_criticality, fp_ready_order,
-            &local_amc->domain->release_queue, &release_queue_bin);
+    bheap_iterate_clear(zss_check_criticality, fp_ready_order,
+            &local_zss->domain->release_queue, &release_queue_bin);
     TRACE_CUR("Update the runqueue for the current criticality.");
 }
 
@@ -180,7 +179,7 @@ static void handle_criticality(struct task_struct* prev){
     }
 }
 
-static int amc_check_criticality(bheap* node){
+static int zss_check_criticality(bheap* node){
     struct task_struct* task = bheap2task(node);
     return (is_task_eligible(node));
 }
@@ -191,31 +190,31 @@ static void reduce_criticality(){
     
 }
 
-static struct task_struct* amc_schedule(struct task_struct * prev)
+static struct task_struct* zss_schedule(struct task_struct * prev)
 {
-	amc_domain_t* 	amc = local_amc;
+	zss_domain_t* 	zss = local_zss;
 	struct task_struct*	next;
     
 	int out_of_time, sleep, preempt, np, exists, blocks, resched, migrate;
 
-	raw_spin_lock(&amc->slock);
+	raw_spin_lock(&zss->slock);
 
 	/* sanity checking
 	 * differently from gedf, when a task exits (dead)
-	 * amc->schedule may be null and prev _is_ realtime
+	 * zss->schedule may be null and prev _is_ realtime
 	 */
-	BUG_ON(amc->scheduled && amc->scheduled != prev);
-	BUG_ON(amc->scheduled && !is_realtime(prev));
+	BUG_ON(zss->scheduled && zss->scheduled != prev);
+	BUG_ON(zss->scheduled && !is_realtime(prev));
 
     /* (0) Determine state */
-	exists      = amc->scheduled != NULL;
+	exists      = zss->scheduled != NULL;
 	blocks      = exists && !is_current_running();
-	out_of_time = exists && budget_enforced(amc->scheduled)
-	                     && budget_exhausted(amc->scheduled);
-	np 	    = exists && is_np(amc->scheduled);
-	sleep	    = exists && is_completed(amc->scheduled);
-	migrate     = exists && get_partition(amc->scheduled) != amc->cpu;
-	preempt     = !blocks && (migrate || fp_preemption_needed(&amc->ready_queue, prev));
+	out_of_time = exists && budget_enforced(zss->scheduled)
+	                     && budget_exhausted(zss->scheduled);
+	np 	    = exists && is_np(zss->scheduled);
+	sleep	    = exists && is_completed(zss->scheduled);
+	migrate     = exists && get_partition(zss->scheduled) != zss->cpu;
+	preempt     = !blocks && (migrate || fp_preemption_needed(&zss->ready_queue, prev));
 
 #ifdef ENABLE_AMC
     /*Main logical components of the AMC are part of the offline strategies.
@@ -240,14 +239,14 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 	 * Multiple calls to request_exit_np() don't hurt.
 	 */
 	if (np && (out_of_time || preempt || sleep))
-		request_exit_np(amc->scheduled);
+		request_exit_np(zss->scheduled);
 
 	/* Any task that is preemptable and either exhausts its execution
 	 * budget or wants to sleep completes. We may have to reschedule after
 	 * this.
 	 */
 	if (!np && (out_of_time || sleep)) {
-		job_completion(amc->scheduled, !sleep);
+		job_completion(zss->scheduled, !sleep);
 		resched = 1;
 	}
 
@@ -262,11 +261,11 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 		 * release queue (if it completed). requeue() picks
 		 * the appropriate queue.
 		 */
-		if (amc->scheduled && !blocks  && !migrate)
-			requeue(amc->scheduled, amc);
-		next = fp_prio_take(&amc->ready_queue);
+		if (zss->scheduled && !blocks  && !migrate)
+			requeue(zss->scheduled, zss);
+		next = fp_prio_take(&zss->ready_queue);
 		if (next == prev) {
-			struct task_struct *t = fp_prio_peek(&amc->ready_queue);
+			struct task_struct *t = fp_prio_peek(&zss->ready_queue);
 			TRACE_TASK(next, "next==prev sleep=%d oot=%d np=%d preempt=%d migrate=%d "
 				   "boost=%d empty=%d prio-idx=%u prio=%u\n",
 				   sleep, out_of_time, np, preempt, migrate,
@@ -298,47 +297,18 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 		TRACE("becoming idle at %llu\n", litmus_clock());
 	}
 
-	amc->scheduled = next;
+	zss->scheduled = next;
 	sched_state_task_picked();
-	raw_spin_unlock(&amc->slock);
+	raw_spin_unlock(&zss->slock);
 
 	return next;
 }
 
-#ifdef CONFIG_LITMUS_LOCKING
-
-/* prev is no longer scheduled --- see if it needs to migrate */
-static void amc_finish_switch(struct task_struct *prev)
-{
-	amc_domain_t *to;
-
-	if (is_realtime(prev) &&
-	    prev->state == TASK_RUNNING &&
-	    get_partition(prev) != smp_processor_id()) {
-		TRACE_TASK(prev, "needs to migrate from P%d to P%d\n",
-			   smp_processor_id(), get_partition(prev));
-
-		to = task_amc(prev);
-
-		raw_spin_lock(&to->slock);
-
-		TRACE_TASK(prev, "adding to queue on P%d\n", to->cpu);
-		requeue(prev, to);
-		if (fp_preemption_needed(&to->ready_queue, to->scheduled))
-			preempt(to);
-
-		raw_spin_unlock(&to->slock);
-
-	}
-}
-
-#endif
-
 /*	Prepare a task for running in RT mode
  */
-static void amc_task_new(struct task_struct * t, int on_rq, int is_scheduled)
+static void zss_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 {
-	amc_domain_t* 	amc = task_amc(t);
+	zss_domain_t* 	zss = task_zss(t);
 	unsigned long		flags;
 
 	TRACE_TASK(t, "P-FP: task new, cpu = %d\n",
@@ -347,27 +317,27 @@ static void amc_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 	/* setup job parameters */
 	release_at(t, litmus_clock());
 
-	raw_spin_lock_irqsave(&amc->slock, flags);
+	raw_spin_lock_irqsave(&zss->slock, flags);
 	if (is_scheduled) {
 		/* there shouldn't be anything else running at the time */
-		BUG_ON(amc->scheduled);
-		amc->scheduled = t;
+		BUG_ON(zss->scheduled);
+		zss->scheduled = t;
 	} else if (on_rq) {
-		requeue(t, amc);
+		requeue(t, zss);
 		/* maybe we have to reschedule */
-		amc_preempt_check(amc);
+		zss_preempt_check(zss);
 	}
-	raw_spin_unlock_irqrestore(&amc->slock, flags);
+	raw_spin_unlock_irqrestore(&zss->slock, flags);
 }
 
-static void amc_task_wake_up(struct task_struct *task)
+static void zss_task_wake_up(struct task_struct *task)
 {
 	unsigned long		flags;
-	amc_domain_t*		amc = task_amc(task);
+	zss_domain_t*		zss = task_zss(task);
 	lt_t			now;
 
 	TRACE_TASK(task, "wake_up at %llu\n", litmus_clock());
-	raw_spin_lock_irqsave(&amc->slock, flags);
+	raw_spin_lock_irqsave(&zss->slock, flags);
 
 #ifdef CONFIG_LITMUS_LOCKING
 	/* Should only be queued when processing a fake-wake up due to a
@@ -401,19 +371,19 @@ static void amc_task_wake_up(struct task_struct *task)
 	 * and won. Also, don't requeue if it is still queued, which can
 	 * happen under the DPCP due wake-ups racing with migrations.
 	 */
-	if (amc->scheduled != task) {
-		requeue(task, amc);
-		amc_preempt_check(amc);
+	if (zss->scheduled != task) {
+		requeue(task, zss);
+		zss_preempt_check(zss);
 	}
 
 #ifdef CONFIG_LITMUS_LOCKING
 out_unlock:
 #endif
-	raw_spin_unlock_irqrestore(&amc->slock, flags);
+	raw_spin_unlock_irqrestore(&zss->slock, flags);
 	TRACE_TASK(task, "wake up done\n");
 }
 
-static void amc_task_block(struct task_struct *t)
+static void zss_task_block(struct task_struct *t)
 {
 	/* only running tasks can block, thus t is in no queue */
 	TRACE_TASK(t, "block at %llu, state=%d\n", litmus_clock(), t->state);
@@ -432,1550 +402,29 @@ static void amc_task_block(struct task_struct *t)
 #endif
 }
 
-static void amc_task_exit(struct task_struct * t)
+static void zss_task_exit(struct task_struct * t)
 {
 	unsigned long flags;
-	amc_domain_t* 	amc = task_amc(t);
+	zss_domain_t* 	zss = task_zss(t);
 	rt_domain_t*		dom;
 
-	raw_spin_lock_irqsave(&amc->slock, flags);
+	raw_spin_lock_irqsave(&zss->slock, flags);
 	if (is_queued(t)) {
 		BUG(); /* This currently doesn't work. */
 		/* dequeue */
 		dom  = task_dom(t);
 		remove(dom, t);
 	}
-	if (amc->scheduled == t) {
-		amc->scheduled = NULL;
-		preempt(amc);
+	if (zss->scheduled == t) {
+		zss->scheduled = NULL;
+		preempt(zss);
 	}
 	TRACE_TASK(t, "RIP, now reschedule\n");
 
-	raw_spin_unlock_irqrestore(&amc->slock, flags);
+	raw_spin_unlock_irqrestore(&zss->slock, flags);
 }
 
-#ifdef CONFIG_LITMUS_LOCKING
-
-#include <litmus/fdso.h>
-#include <litmus/srp.h>
-
-static void fp_dequeue(amc_domain_t* amc, struct task_struct* t)
-{
-	BUG_ON(amc->scheduled == t && is_queued(t));
-	if (is_queued(t))
-		fp_prio_remove(&amc->ready_queue, t, priority_index(t));
-}
-
-static void fp_set_prio_inh(amc_domain_t* amc, struct task_struct* t,
-			    struct task_struct* prio_inh)
-{
-	int requeue;
-
-	if (!t || t->rt_param.inh_task == prio_inh) {
-		/* no update  required */
-		if (t)
-			TRACE_TASK(t, "no prio-inh update required\n");
-		return;
-	}
-
-	requeue = is_queued(t);
-	TRACE_TASK(t, "prio-inh: is_queued:%d\n", requeue);
-
-	if (requeue)
-		/* first remove */
-		fp_dequeue(amc, t);
-
-	t->rt_param.inh_task = prio_inh;
-
-	if (requeue)
-		/* add again to the right queue */
-		fp_prio_add(&amc->ready_queue, t, priority_index(t));
-}
-
-static int effective_agent_priority(int prio)
-{
-	/* make sure agents have higher priority */
-	return prio - LITMUS_MAX_PRIORITY;
-}
-
-static lt_t prio_point(int eprio)
-{
-	/* make sure we have non-negative prio points */
-	return eprio + LITMUS_MAX_PRIORITY;
-}
-
-static void boost_priority(struct task_struct* t, lt_t priority_point)
-{
-	unsigned long		flags;
-	amc_domain_t* 	amc = task_amc(t);
-
-	raw_spin_lock_irqsave(&amc->slock, flags);
-
-
-	TRACE_TASK(t, "priority boosted at %llu\n", litmus_clock());
-
-	tsk_rt(t)->priority_boosted = 1;
-	/* tie-break by protocol-specific priority point */
-	tsk_rt(t)->boost_start_time = priority_point;
-
-	/* Priority boosting currently only takes effect for already-scheduled
-	 * tasks. This is sufficient since priority boosting only kicks in as
-	 * part of lock acquisitions. */
-	BUG_ON(amc->scheduled != t);
-
-	raw_spin_unlock_irqrestore(&amc->slock, flags);
-}
-
-static void unboost_priority(struct task_struct* t)
-{
-	unsigned long		flags;
-	amc_domain_t* 	amc = task_amc(t);
-
-	raw_spin_lock_irqsave(&amc->slock, flags);
-
-	/* Assumption: this only happens when the job is scheduled.
-	 * Exception: If t transitioned to non-real-time mode, we no longer
-	 * care abou tit. */
-	BUG_ON(amc->scheduled != t && is_realtime(t));
-
-	TRACE_TASK(t, "priority restored at %llu\n", litmus_clock());
-
-	tsk_rt(t)->priority_boosted = 0;
-	tsk_rt(t)->boost_start_time = 0;
-
-	/* check if this changes anything */
-	if (fp_preemption_needed(&amc->ready_queue, amc->scheduled))
-		preempt(amc);
-
-	raw_spin_unlock_irqrestore(&amc->slock, flags);
-}
-
-/* ******************** SRP support ************************ */
-
-static unsigned int amc_get_srp_prio(struct task_struct* t)
-{
-	return get_priority(t);
-}
-
-/* ******************** FMLP support ********************** */
-
-struct fmlp_semaphore {
-	struct litmus_lock litmus_lock;
-
-	/* current resource holder */
-	struct task_struct *owner;
-
-	/* FIFO queue of waiting tasks */
-	wait_queue_head_t wait;
-};
-
-static inline struct fmlp_semaphore* fmlp_from_lock(struct litmus_lock* lock)
-{
-	return container_of(lock, struct fmlp_semaphore, litmus_lock);
-}
-
-static inline lt_t
-fmlp_clock(void)
-{
-	return (lt_t) this_cpu_inc_return(fmlp_timestamp);
-}
-
-int amc_fmlp_lock(struct litmus_lock* l)
-{
-	struct task_struct* t = current;
-	struct fmlp_semaphore *sem = fmlp_from_lock(l);
-	wait_queue_t wait;
-	unsigned long flags;
-	lt_t time_of_request;
-
-	if (!is_realtime(t))
-		return -EPERM;
-
-	/* prevent nested lock acquisition --- not supported by FMLP */
-	if (tsk_rt(t)->num_locks_held ||
-	    tsk_rt(t)->num_local_locks_held)
-		return -EBUSY;
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	/* tie-break by this point in time */
-	time_of_request = fmlp_clock();
-
-	/* Priority-boost ourself *before* we suspend so that
-	 * our priority is boosted when we resume. */
-	boost_priority(t, time_of_request);
-
-	if (sem->owner) {
-		/* resource is not free => must suspend and wait */
-
-		init_waitqueue_entry(&wait, t);
-
-		/* FIXME: interruptible would be nice some day */
-		set_task_state(t, TASK_UNINTERRUPTIBLE);
-
-		__add_wait_queue_tail_exclusive(&sem->wait, &wait);
-
-		TS_LOCK_SUSPEND;
-
-		/* release lock before sleeping */
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-		/* We depend on the FIFO order.  Thus, we don't need to recheck
-		 * when we wake up; we are guaranteed to have the lock since
-		 * there is only one wake up per release.
-		 */
-
-		schedule();
-
-		TS_LOCK_RESUME;
-
-		/* Since we hold the lock, no other task will change
-		 * ->owner. We can thus check it without acquiring the spin
-		 * lock. */
-		BUG_ON(sem->owner != t);
-	} else {
-		/* it's ours now */
-		sem->owner = t;
-
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
-	}
-
-	tsk_rt(t)->num_locks_held++;
-
-	return 0;
-}
-
-int amc_fmlp_unlock(struct litmus_lock* l)
-{
-	struct task_struct *t = current, *next = NULL;
-	struct fmlp_semaphore *sem = fmlp_from_lock(l);
-	unsigned long flags;
-	int err = 0;
-
-	preempt_disable();
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	if (sem->owner != t) {
-		err = -EINVAL;
-		goto out;
-	}
-
-	tsk_rt(t)->num_locks_held--;
-
-	/* we lose the benefit of priority boosting */
-
-	unboost_priority(t);
-
-	/* check if there are jobs waiting for this resource */
-	next = __waitqueue_remove_first(&sem->wait);
-	sem->owner = next;
-
-out:
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-	/* Wake up next. The waiting job is already priority-boosted. */
-	if(next) {
-		wake_up_process(next);
-	}
-
-	preempt_enable();
-
-	return err;
-}
-
-int amc_fmlp_close(struct litmus_lock* l)
-{
-	struct task_struct *t = current;
-	struct fmlp_semaphore *sem = fmlp_from_lock(l);
-	unsigned long flags;
-
-	int owner;
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	owner = sem->owner == t;
-
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-	if (owner)
-		amc_fmlp_unlock(l);
-
-	return 0;
-}
-
-void amc_fmlp_free(struct litmus_lock* lock)
-{
-	kfree(fmlp_from_lock(lock));
-}
-
-static struct litmus_lock_ops amc_fmlp_lock_ops = {
-	.close  = amc_fmlp_close,
-	.lock   = amc_fmlp_lock,
-	.unlock = amc_fmlp_unlock,
-	.deallocate = amc_fmlp_free,
-};
-
-static struct litmus_lock* amc_new_fmlp(void)
-{
-	struct fmlp_semaphore* sem;
-
-	sem = kmalloc(sizeof(*sem), GFP_KERNEL);
-	if (!sem)
-		return NULL;
-
-	sem->owner   = NULL;
-	init_waitqueue_head(&sem->wait);
-	sem->litmus_lock.ops = &amc_fmlp_lock_ops;
-
-	return &sem->litmus_lock;
-}
-
-/* ******************** MPCP support ********************** */
-
-struct mpcp_semaphore {
-	struct litmus_lock litmus_lock;
-
-	/* current resource holder */
-	struct task_struct *owner;
-
-	/* priority queue of waiting tasks */
-	wait_queue_head_t wait;
-
-	/* priority ceiling per cpu */
-	unsigned int prio_ceiling[NR_CPUS];
-
-	/* should jobs spin "virtually" for this resource? */
-	int vspin;
-};
-
-#define OMEGA_CEILING UINT_MAX
-
-/* Since jobs spin "virtually" while waiting to acquire a lock,
- * they first must aquire a local per-cpu resource.
- */
-static DEFINE_PER_CPU(wait_queue_head_t, mpcpvs_vspin_wait);
-static DEFINE_PER_CPU(struct task_struct*, mpcpvs_vspin);
-
-/* called with preemptions off <=> no local modifications */
-static void mpcp_vspin_enter(void)
-{
-	struct task_struct* t = current;
-
-	while (1) {
-		if (this_cpu_read(mpcpvs_vspin) == NULL) {
-			/* good, we get to issue our request */
-			this_cpu_write(mpcpvs_vspin, t);
-			break;
-		} else {
-			/* some job is spinning => enqueue in request queue */
-			prio_wait_queue_t wait;
-			wait_queue_head_t* vspin = this_cpu_ptr(&mpcpvs_vspin_wait);
-			unsigned long flags;
-
-			/* ordered by regular priority */
-			init_prio_waitqueue_entry(&wait, t, prio_point(get_priority(t)));
-
-			spin_lock_irqsave(&vspin->lock, flags);
-
-			set_task_state(t, TASK_UNINTERRUPTIBLE);
-
-			__add_wait_queue_prio_exclusive(vspin, &wait);
-
-			spin_unlock_irqrestore(&vspin->lock, flags);
-
-			TS_LOCK_SUSPEND;
-
-			preempt_enable_no_resched();
-
-			schedule();
-
-			preempt_disable();
-
-			TS_LOCK_RESUME;
-			/* Recheck if we got it --- some higher-priority process might
-			 * have swooped in. */
-		}
-	}
-	/* ok, now it is ours */
-}
-
-/* called with preemptions off */
-static void mpcp_vspin_exit(void)
-{
-	struct task_struct* t = current, *next;
-	unsigned long flags;
-	wait_queue_head_t* vspin = this_cpu_ptr(&mpcpvs_vspin_wait);
-
-	BUG_ON(this_cpu_read(mpcpvs_vspin) != t);
-
-	/* no spinning job */
-	this_cpu_write(mpcpvs_vspin, NULL);
-
-	/* see if anyone is waiting for us to stop "spinning" */
-	spin_lock_irqsave(&vspin->lock, flags);
-	next = __waitqueue_remove_first(vspin);
-
-	if (next)
-		wake_up_process(next);
-
-	spin_unlock_irqrestore(&vspin->lock, flags);
-}
-
-static inline struct mpcp_semaphore* mpcp_from_lock(struct litmus_lock* lock)
-{
-	return container_of(lock, struct mpcp_semaphore, litmus_lock);
-}
-
-int amc_mpcp_lock(struct litmus_lock* l)
-{
-	struct task_struct* t = current;
-	struct mpcp_semaphore *sem = mpcp_from_lock(l);
-	prio_wait_queue_t wait;
-	unsigned long flags;
-
-	if (!is_realtime(t))
-		return -EPERM;
-
-	/* prevent nested lock acquisition */
-	if (tsk_rt(t)->num_locks_held ||
-	    tsk_rt(t)->num_local_locks_held)
-		return -EBUSY;
-
-	preempt_disable();
-
-	if (sem->vspin)
-		mpcp_vspin_enter();
-
-	/* Priority-boost ourself *before* we suspend so that
-	 * our priority is boosted when we resume. Use the priority
-	 * ceiling for the local partition. */
-	boost_priority(t, sem->prio_ceiling[get_partition(t)]);
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	preempt_enable_no_resched();
-
-	if (sem->owner) {
-		/* resource is not free => must suspend and wait */
-
-		/* ordered by regular priority */
-		init_prio_waitqueue_entry(&wait, t, prio_point(get_priority(t)));
-
-		/* FIXME: interruptible would be nice some day */
-		set_task_state(t, TASK_UNINTERRUPTIBLE);
-
-		__add_wait_queue_prio_exclusive(&sem->wait, &wait);
-
-		TS_LOCK_SUSPEND;
-
-		/* release lock before sleeping */
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-		/* We depend on the FIFO order.  Thus, we don't need to recheck
-		 * when we wake up; we are guaranteed to have the lock since
-		 * there is only one wake up per release.
-		 */
-
-		schedule();
-
-		TS_LOCK_RESUME;
-
-		/* Since we hold the lock, no other task will change
-		 * ->owner. We can thus check it without acquiring the spin
-		 * lock. */
-		BUG_ON(sem->owner != t);
-	} else {
-		/* it's ours now */
-		sem->owner = t;
-
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
-	}
-
-	tsk_rt(t)->num_locks_held++;
-
-	return 0;
-}
-
-int amc_mpcp_unlock(struct litmus_lock* l)
-{
-	struct task_struct *t = current, *next = NULL;
-	struct mpcp_semaphore *sem = mpcp_from_lock(l);
-	unsigned long flags;
-	int err = 0;
-
-	preempt_disable();
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	if (sem->owner != t) {
-		err = -EINVAL;
-		goto out;
-	}
-
-	tsk_rt(t)->num_locks_held--;
-
-	/* we lose the benefit of priority boosting */
-	unboost_priority(t);
-
-	/* check if there are jobs waiting for this resource */
-	next = __waitqueue_remove_first(&sem->wait);
-	sem->owner = next;
-
-out:
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-	/* Wake up next. The waiting job is already priority-boosted. */
-	if(next) {
-		wake_up_process(next);
-	}
-
-	if (sem->vspin && err == 0) {
-		mpcp_vspin_exit();
-	}
-
-	preempt_enable();
-
-	return err;
-}
-
-int amc_mpcp_open(struct litmus_lock* l, void* config)
-{
-	struct task_struct *t = current;
-	int cpu, local_cpu;
-	struct mpcp_semaphore *sem = mpcp_from_lock(l);
-	unsigned long flags;
-
-	if (!is_realtime(t))
-		/* we need to know the real-time priority */
-		return -EPERM;
-
-	local_cpu = get_partition(t);
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-	for (cpu = 0; cpu < NR_CPUS; cpu++) {
-		if (cpu != local_cpu) {
-			sem->prio_ceiling[cpu] = min(sem->prio_ceiling[cpu],
-						     get_priority(t));
-			TRACE_CUR("priority ceiling for sem %p is now %d on cpu %d\n",
-				  sem, sem->prio_ceiling[cpu], cpu);
-		}
-	}
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-	return 0;
-}
-
-int amc_mpcp_close(struct litmus_lock* l)
-{
-	struct task_struct *t = current;
-	struct mpcp_semaphore *sem = mpcp_from_lock(l);
-	unsigned long flags;
-
-	int owner;
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	owner = sem->owner == t;
-
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-	if (owner)
-		amc_mpcp_unlock(l);
-
-	return 0;
-}
-
-void amc_mpcp_free(struct litmus_lock* lock)
-{
-	kfree(mpcp_from_lock(lock));
-}
-
-static struct litmus_lock_ops amc_mpcp_lock_ops = {
-	.close  = amc_mpcp_close,
-	.lock   = amc_mpcp_lock,
-	.open	= amc_mpcp_open,
-	.unlock = amc_mpcp_unlock,
-	.deallocate = amc_mpcp_free,
-};
-
-static struct litmus_lock* amc_new_mpcp(int vspin)
-{
-	struct mpcp_semaphore* sem;
-	int cpu;
-
-	sem = kmalloc(sizeof(*sem), GFP_KERNEL);
-	if (!sem)
-		return NULL;
-
-	sem->owner   = NULL;
-	init_waitqueue_head(&sem->wait);
-	sem->litmus_lock.ops = &amc_mpcp_lock_ops;
-
-	for (cpu = 0; cpu < NR_CPUS; cpu++)
-		sem->prio_ceiling[cpu] = OMEGA_CEILING;
-
-	/* mark as virtual spinning */
-	sem->vspin = vspin;
-
-	return &sem->litmus_lock;
-}
-
-
-/* ******************** PCP support ********************** */
-
-
-struct pcp_semaphore {
-	struct litmus_lock litmus_lock;
-
-	struct list_head ceiling;
-
-	/* current resource holder */
-	struct task_struct *owner;
-
-	/* priority ceiling --- can be negative due to DPCP support */
-	int prio_ceiling;
-
-	/* on which processor is this PCP semaphore allocated? */
-	int on_cpu;
-};
-
-static inline struct pcp_semaphore* pcp_from_lock(struct litmus_lock* lock)
-{
-	return container_of(lock, struct pcp_semaphore, litmus_lock);
-}
-
-
-struct pcp_state {
-	struct list_head system_ceiling;
-
-	/* highest-priority waiting task */
-	struct task_struct* hp_waiter;
-
-	/* list of jobs waiting to get past the system ceiling */
-	wait_queue_head_t ceiling_blocked;
-};
-
-static void pcp_init_state(struct pcp_state* s)
-{
-	INIT_LIST_HEAD(&s->system_ceiling);
-	s->hp_waiter = NULL;
-	init_waitqueue_head(&s->ceiling_blocked);
-}
-
-static DEFINE_PER_CPU(struct pcp_state, pcp_state);
-
-/* assumes preemptions are off */
-static struct pcp_semaphore* pcp_get_ceiling(void)
-{
-	struct list_head* top = &(this_cpu_ptr(&pcp_state)->system_ceiling);
-	return list_first_entry_or_null(top, struct pcp_semaphore, ceiling);
-}
-
-/* assumes preempt off */
-static void pcp_add_ceiling(struct pcp_semaphore* sem)
-{
-	struct list_head *pos;
-	struct list_head *in_use = &(this_cpu_ptr(&pcp_state)->system_ceiling);
-	struct pcp_semaphore* held;
-
-	BUG_ON(sem->on_cpu != smp_processor_id());
-	BUG_ON(in_list(&sem->ceiling));
-
-	list_for_each(pos, in_use) {
-		held = list_entry(pos, struct pcp_semaphore, ceiling);
-		if (held->prio_ceiling >= sem->prio_ceiling) {
-			__list_add(&sem->ceiling, pos->prev, pos);
-			return;
-		}
-	}
-
-	/* we hit the end of the list */
-
-	list_add_tail(&sem->ceiling, in_use);
-}
-
-/* assumes preempt off */
-static int pcp_exceeds_ceiling(struct pcp_semaphore* ceiling,
-			      struct task_struct* task,
-			      int effective_prio)
-{
-	return ceiling == NULL ||
-		ceiling->prio_ceiling > effective_prio ||
-		ceiling->owner == task;
-}
-
-/* assumes preempt off */
-static void pcp_priority_inheritance(void)
-{
-	unsigned long	flags;
-	amc_domain_t* 	amc = local_amc;
-
-	struct pcp_semaphore* ceiling = pcp_get_ceiling();
-	struct task_struct *blocker, *blocked;
-
-	blocker = ceiling ?  ceiling->owner : NULL;
-	blocked = this_cpu_ptr(&pcp_state)->hp_waiter;
-
-	raw_spin_lock_irqsave(&amc->slock, flags);
-
-	/* Current is no longer inheriting anything by default.  This should be
-	 * the currently scheduled job, and hence not currently queued.
-	 * Special case: if current stopped being a real-time task, it will no longer
-	 * be registered as amc->scheduled. */
-	BUG_ON(current != amc->scheduled && is_realtime(current));
-
-	fp_set_prio_inh(amc, current, NULL);
-	fp_set_prio_inh(amc, blocked, NULL);
-	fp_set_prio_inh(amc, blocker, NULL);
-
-	/* Let blocking job inherit priority of blocked job, if required. */
-	if (blocker && blocked &&
-	    fp_higher_prio(blocked, blocker)) {
-		TRACE_TASK(blocker, "PCP inherits from %s/%d (prio %u -> %u) \n",
-			   blocked->comm, blocked->pid,
-			   get_priority(blocker), get_priority(blocked));
-		fp_set_prio_inh(amc, blocker, blocked);
-	}
-
-	/* Check if anything changed. If the blocked job is current, then it is
-	 * just blocking and hence is going to call the scheduler anyway. */
-	if (blocked != current &&
-	    fp_higher_prio(fp_prio_peek(&amc->ready_queue), amc->scheduled))
-		preempt(amc);
-
-	raw_spin_unlock_irqrestore(&amc->slock, flags);
-}
-
-/* called with preemptions off */
-static void pcp_raise_ceiling(struct pcp_semaphore* sem,
-			      int effective_prio)
-{
-	struct task_struct* t = current;
-	struct pcp_semaphore* ceiling;
-	prio_wait_queue_t wait;
-	unsigned int waiting_higher_prio;
-
-	while(1) {
-		ceiling = pcp_get_ceiling();
-		if (pcp_exceeds_ceiling(ceiling, t, effective_prio))
-			break;
-
-		TRACE_CUR("PCP ceiling-blocked, wanted sem %p, but %s/%d has the ceiling \n",
-			  sem, ceiling->owner->comm, ceiling->owner->pid);
-
-		/* we need to wait until the ceiling is lowered */
-
-		/* enqueue in priority order */
-		init_prio_waitqueue_entry(&wait, t, effective_prio);
-		set_task_state(t, TASK_UNINTERRUPTIBLE);
-		waiting_higher_prio = add_wait_queue_prio_exclusive(
-			&(this_cpu_ptr(&pcp_state)->ceiling_blocked), &wait);
-
-		if (waiting_higher_prio == 0) {
-			TRACE_CUR("PCP new highest-prio waiter => prio inheritance\n");
-
-			/* we are the new highest-priority waiting job
-			 * => update inheritance */
-			this_cpu_ptr(&pcp_state)->hp_waiter = t;
-			pcp_priority_inheritance();
-		}
-
-		TS_LOCK_SUSPEND;
-
-		preempt_enable_no_resched();
-		schedule();
-		preempt_disable();
-
-		/* pcp_resume_unblocked() removed us from wait queue */
-
-		TS_LOCK_RESUME;
-	}
-
-	TRACE_CUR("PCP got the ceiling and sem %p\n", sem);
-
-	/* We are good to go. The semaphore should be available. */
-	BUG_ON(sem->owner != NULL);
-
-	sem->owner = t;
-
-	pcp_add_ceiling(sem);
-}
-
-static void pcp_resume_unblocked(void)
-{
-	wait_queue_head_t *blocked =  &(this_cpu_ptr(&pcp_state)->ceiling_blocked);
-	unsigned long flags;
-	prio_wait_queue_t* q;
-	struct task_struct* t = NULL;
-
-	struct pcp_semaphore* ceiling = pcp_get_ceiling();
-
-	spin_lock_irqsave(&blocked->lock, flags);
-
-	while (waitqueue_active(blocked)) {
-		/* check first == highest-priority waiting job */
-		q = list_entry(blocked->task_list.next,
-			       prio_wait_queue_t, wq.task_list);
-		t = (struct task_struct*) q->wq.private;
-
-		/* can it proceed now? => let it go */
-		if (pcp_exceeds_ceiling(ceiling, t, q->priority)) {
-		    __remove_wait_queue(blocked, &q->wq);
-		    wake_up_process(t);
-		} else {
-			/* We are done. Update highest-priority waiter. */
-			this_cpu_ptr(&pcp_state)->hp_waiter = t;
-			goto out;
-		}
-	}
-	/* If we get here, then there are no more waiting
-	 * jobs. */
-	this_cpu_ptr(&pcp_state)->hp_waiter = NULL;
-out:
-	spin_unlock_irqrestore(&blocked->lock, flags);
-}
-
-/* assumes preempt off */
-static void pcp_lower_ceiling(struct pcp_semaphore* sem)
-{
-	BUG_ON(!in_list(&sem->ceiling));
-	BUG_ON(sem->owner != current);
-	BUG_ON(sem->on_cpu != smp_processor_id());
-
-	/* remove from ceiling list */
-	list_del(&sem->ceiling);
-
-	/* release */
-	sem->owner = NULL;
-
-	TRACE_CUR("PCP released sem %p\n", sem);
-
-	/* Wake up all ceiling-blocked jobs that now pass the ceiling. */
-	pcp_resume_unblocked();
-
-	pcp_priority_inheritance();
-}
-
-static void pcp_update_prio_ceiling(struct pcp_semaphore* sem,
-				    int effective_prio)
-{
-	/* This needs to be synchronized on something.
-	 * Might as well use waitqueue lock for the processor.
-	 * We assume this happens only before the task set starts execution,
-	 * (i.e., during initialization), but it may happen on multiple processors
-	 * at the same time.
-	 */
-	unsigned long flags;
-
-	struct pcp_state* s = &per_cpu(pcp_state, sem->on_cpu);
-
-	spin_lock_irqsave(&s->ceiling_blocked.lock, flags);
-
-	sem->prio_ceiling = min(sem->prio_ceiling, effective_prio);
-
-	spin_unlock_irqrestore(&s->ceiling_blocked.lock, flags);
-}
-
-static void pcp_init_semaphore(struct pcp_semaphore* sem, int cpu)
-{
-	sem->owner   = NULL;
-	INIT_LIST_HEAD(&sem->ceiling);
-	sem->prio_ceiling = INT_MAX;
-	sem->on_cpu = cpu;
-}
-
-int amc_pcp_lock(struct litmus_lock* l)
-{
-	struct task_struct* t = current;
-	struct pcp_semaphore *sem = pcp_from_lock(l);
-
-	/* The regular PCP uses the regular task priorities, not agent
-	 * priorities. */
-	int eprio = get_priority(t);
-	int from  = get_partition(t);
-	int to    = sem->on_cpu;
-
-	if (!is_realtime(t) || from != to)
-		return -EPERM;
-
-	/* prevent nested lock acquisition in global critical section */
-	if (tsk_rt(t)->num_locks_held)
-		return -EBUSY;
-
-	preempt_disable();
-
-	pcp_raise_ceiling(sem, eprio);
-
-	preempt_enable();
-
-	tsk_rt(t)->num_local_locks_held++;
-
-	return 0;
-}
-
-int amc_pcp_unlock(struct litmus_lock* l)
-{
-	struct task_struct *t = current;
-	struct pcp_semaphore *sem = pcp_from_lock(l);
-
-	int err = 0;
-
-	preempt_disable();
-
-	if (sem->owner != t) {
-		err = -EINVAL;
-		goto out;
-	}
-
-	/* The current owner should be executing on the correct CPU.
-	 *
-	 * If the owner transitioned out of RT mode or is exiting, then
-	 * we it might have already been migrated away by the best-effort
-	 * scheduler and we just have to deal with it. */
-	if (unlikely(!is_realtime(t) && sem->on_cpu != smp_processor_id())) {
-		TRACE_TASK(t, "PCP unlock cpu=%d, sem->on_cpu=%d\n",
-			smp_processor_id(), sem->on_cpu);
-		preempt_enable();
-		err = litmus_be_migrate_to(sem->on_cpu);
-		preempt_disable();
-		TRACE_TASK(t, "post-migrate: cpu=%d, sem->on_cpu=%d err=%d\n",
-			smp_processor_id(), sem->on_cpu, err);
-	}
-	BUG_ON(sem->on_cpu != smp_processor_id());
-	err = 0;
-
-	tsk_rt(t)->num_local_locks_held--;
-
-	/* give it back */
-	pcp_lower_ceiling(sem);
-
-out:
-	preempt_enable();
-
-	return err;
-}
-
-int amc_pcp_open(struct litmus_lock* l, void* __user config)
-{
-	struct task_struct *t = current;
-	struct pcp_semaphore *sem = pcp_from_lock(l);
-
-	int cpu, eprio;
-
-	if (!is_realtime(t))
-		/* we need to know the real-time priority */
-		return -EPERM;
-
-	if (!config)
-		cpu = get_partition(t);
-	else if (get_user(cpu, (int*) config))
-		return -EFAULT;
-
-	/* make sure the resource location matches */
-	if (cpu != sem->on_cpu)
-		return -EINVAL;
-
-	/* The regular PCP uses regular task priorites, not agent
-	 * priorities. */
-	eprio = get_priority(t);
-
-	pcp_update_prio_ceiling(sem, eprio);
-
-	return 0;
-}
-
-int amc_pcp_close(struct litmus_lock* l)
-{
-	struct task_struct *t = current;
-	struct pcp_semaphore *sem = pcp_from_lock(l);
-
-	int owner = 0;
-
-	preempt_disable();
-
-	if (sem->on_cpu == smp_processor_id())
-		owner = sem->owner == t;
-
-	preempt_enable();
-
-	if (owner)
-		amc_pcp_unlock(l);
-
-	return 0;
-}
-
-void amc_pcp_free(struct litmus_lock* lock)
-{
-	kfree(pcp_from_lock(lock));
-}
-
-
-static struct litmus_lock_ops amc_pcp_lock_ops = {
-	.close  = amc_pcp_close,
-	.lock   = amc_pcp_lock,
-	.open	= amc_pcp_open,
-	.unlock = amc_pcp_unlock,
-	.deallocate = amc_pcp_free,
-};
-
-
-static struct litmus_lock* amc_new_pcp(int on_cpu)
-{
-	struct pcp_semaphore* sem;
-
-	sem = kmalloc(sizeof(*sem), GFP_KERNEL);
-	if (!sem)
-		return NULL;
-
-	sem->litmus_lock.ops = &amc_pcp_lock_ops;
-	pcp_init_semaphore(sem, on_cpu);
-
-	return &sem->litmus_lock;
-}
-
-/* ******************** DPCP support ********************** */
-
-struct dpcp_semaphore {
-	struct litmus_lock litmus_lock;
-	struct pcp_semaphore  pcp;
-	int owner_cpu;
-};
-
-static inline struct dpcp_semaphore* dpcp_from_lock(struct litmus_lock* lock)
-{
-	return container_of(lock, struct dpcp_semaphore, litmus_lock);
-}
-
-/* called with preemptions disabled */
-static void amc_migrate_to(int target_cpu)
-{
-	struct task_struct* t = current;
-	amc_domain_t *from;
-
-	if (get_partition(t) == target_cpu)
-		return;
-
-	if (!is_realtime(t))
-	{
-		TRACE_TASK(t, "not migrating, not a RT task (anymore?)\n");
-		return;
-	}
-
-	/* make sure target_cpu makes sense */
-	BUG_ON(target_cpu >= NR_CPUS || !cpu_online(target_cpu));
-
-	local_irq_disable();
-
-	from = task_amc(t);
-	raw_spin_lock(&from->slock);
-
-	/* Scheduled task should not be in any ready or release queue.  Check
-	 * this while holding the lock to avoid RT mode transitions.*/
-	BUG_ON(is_realtime(t) && is_queued(t));
-
-	/* switch partitions */
-	tsk_rt(t)->task_params.cpu = target_cpu;
-
-	raw_spin_unlock(&from->slock);
-
-	/* Don't trace scheduler costs as part of
-	 * locking overhead. Scheduling costs are accounted for
-	 * explicitly. */
-	TS_LOCK_SUSPEND;
-
-	local_irq_enable();
-	preempt_enable_no_resched();
-
-	/* deschedule to be migrated */
-	schedule();
-
-	/* we are now on the target processor */
-	preempt_disable();
-
-	/* start recording costs again */
-	TS_LOCK_RESUME;
-
-	BUG_ON(smp_processor_id() != target_cpu && is_realtime(t));
-}
-
-int amc_dpcp_lock(struct litmus_lock* l)
-{
-	struct task_struct* t = current;
-	struct dpcp_semaphore *sem = dpcp_from_lock(l);
-	int eprio = effective_agent_priority(get_priority(t));
-	int from  = get_partition(t);
-	int to    = sem->pcp.on_cpu;
-
-	if (!is_realtime(t))
-		return -EPERM;
-
-	/* prevent nested lock accquisition */
-	if (tsk_rt(t)->num_locks_held ||
-	    tsk_rt(t)->num_local_locks_held)
-		return -EBUSY;
-
-	preempt_disable();
-
-	/* Priority-boost ourself *before* we suspend so that
-	 * our priority is boosted when we resume. */
-
-	boost_priority(t, get_priority(t));
-
-	amc_migrate_to(to);
-
-	pcp_raise_ceiling(&sem->pcp, eprio);
-
-	/* yep, we got it => execute request */
-	sem->owner_cpu = from;
-
-	preempt_enable();
-
-	tsk_rt(t)->num_locks_held++;
-
-	return 0;
-}
-
-int amc_dpcp_unlock(struct litmus_lock* l)
-{
-	struct task_struct *t = current;
-	struct dpcp_semaphore *sem = dpcp_from_lock(l);
-	int err = 0;
-	int home;
-
-	preempt_disable();
-
-	if (sem->pcp.owner != t) {
-		err = -EINVAL;
-		goto out;
-	}
-
-	/* The current owner should be executing on the correct CPU.
-	 *
-	 * If the owner transitioned out of RT mode or is exiting, then
-	 * we it might have already been migrated away by the best-effort
-	 * scheduler and we just have to deal with it. */
-	if (unlikely(!is_realtime(t) && sem->pcp.on_cpu != smp_processor_id())) {
-		TRACE_TASK(t, "DPCP unlock cpu=%d, sem->pcp.on_cpu=%d\n", smp_processor_id(), sem->pcp.on_cpu);
-		preempt_enable();
-		err = litmus_be_migrate_to(sem->pcp.on_cpu);
-		preempt_disable();
-		TRACE_TASK(t, "post-migrate: cpu=%d, sem->pcp.on_cpu=%d err=%d\n", smp_processor_id(), sem->pcp.on_cpu, err);
-	}
-	BUG_ON(sem->pcp.on_cpu != smp_processor_id());
-	err = 0;
-
-	tsk_rt(t)->num_locks_held--;
-
-	home = sem->owner_cpu;
-
-	/* give it back */
-	pcp_lower_ceiling(&sem->pcp);
-
-	/* we lose the benefit of priority boosting */
-	unboost_priority(t);
-
-	amc_migrate_to(home);
-
-out:
-	preempt_enable();
-
-	return err;
-}
-
-int amc_dpcp_open(struct litmus_lock* l, void* __user config)
-{
-	struct task_struct *t = current;
-	struct dpcp_semaphore *sem = dpcp_from_lock(l);
-	int cpu, eprio;
-
-	if (!is_realtime(t))
-		/* we need to know the real-time priority */
-		return -EPERM;
-
-	if (get_user(cpu, (int*) config))
-		return -EFAULT;
-
-	/* make sure the resource location matches */
-	if (cpu != sem->pcp.on_cpu)
-		return -EINVAL;
-
-	eprio = effective_agent_priority(get_priority(t));
-
-	pcp_update_prio_ceiling(&sem->pcp, eprio);
-
-	return 0;
-}
-
-int amc_dpcp_close(struct litmus_lock* l)
-{
-	struct task_struct *t = current;
-	struct dpcp_semaphore *sem = dpcp_from_lock(l);
-	int owner = 0;
-
-	preempt_disable();
-
-	if (sem->pcp.on_cpu == smp_processor_id())
-		owner = sem->pcp.owner == t;
-
-	preempt_enable();
-
-	if (owner)
-		amc_dpcp_unlock(l);
-
-	return 0;
-}
-
-void amc_dpcp_free(struct litmus_lock* lock)
-{
-	kfree(dpcp_from_lock(lock));
-}
-
-static struct litmus_lock_ops amc_dpcp_lock_ops = {
-	.close  = amc_dpcp_close,
-	.lock   = amc_dpcp_lock,
-	.open	= amc_dpcp_open,
-	.unlock = amc_dpcp_unlock,
-	.deallocate = amc_dpcp_free,
-};
-
-static struct litmus_lock* amc_new_dpcp(int on_cpu)
-{
-	struct dpcp_semaphore* sem;
-
-	sem = kmalloc(sizeof(*sem), GFP_KERNEL);
-	if (!sem)
-		return NULL;
-
-	sem->litmus_lock.ops = &amc_dpcp_lock_ops;
-	sem->owner_cpu = NO_CPU;
-	pcp_init_semaphore(&sem->pcp, on_cpu);
-
-	return &sem->litmus_lock;
-}
-
-
-/* ******************** DFLP support ********************** */
-
-struct dflp_semaphore {
-	struct litmus_lock litmus_lock;
-
-	/* current resource holder */
-	struct task_struct *owner;
-	int owner_cpu;
-
-	/* FIFO queue of waiting tasks */
-	wait_queue_head_t wait;
-
-	/* where is the resource assigned to */
-	int on_cpu;
-};
-
-static inline struct dflp_semaphore* dflp_from_lock(struct litmus_lock* lock)
-{
-	return container_of(lock, struct dflp_semaphore, litmus_lock);
-}
-
-int amc_dflp_lock(struct litmus_lock* l)
-{
-	struct task_struct* t = current;
-	struct dflp_semaphore *sem = dflp_from_lock(l);
-	int from  = get_partition(t);
-	int to    = sem->on_cpu;
-	unsigned long flags;
-	wait_queue_t wait;
-	lt_t time_of_request;
-
-	if (!is_realtime(t))
-		return -EPERM;
-
-	/* prevent nested lock accquisition */
-	if (tsk_rt(t)->num_locks_held ||
-	    tsk_rt(t)->num_local_locks_held)
-		return -EBUSY;
-
-	preempt_disable();
-
-	/* tie-break by this point in time */
-	time_of_request = litmus_clock();
-
-	/* Priority-boost ourself *before* we suspend so that
-	 * our priority is boosted when we resume. */
-	boost_priority(t, time_of_request);
-
-	amc_migrate_to(to);
-
-	/* Now on the right CPU, preemptions still disabled. */
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	if (sem->owner) {
-		/* resource is not free => must suspend and wait */
-
-		init_waitqueue_entry(&wait, t);
-
-		/* FIXME: interruptible would be nice some day */
-		set_task_state(t, TASK_UNINTERRUPTIBLE);
-
-		__add_wait_queue_tail_exclusive(&sem->wait, &wait);
-
-		TS_LOCK_SUSPEND;
-
-		/* release lock before sleeping */
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-		/* We depend on the FIFO order.  Thus, we don't need to recheck
-		 * when we wake up; we are guaranteed to have the lock since
-		 * there is only one wake up per release.
-		 */
-
-		preempt_enable_no_resched();
-
-		schedule();
-
-		preempt_disable();
-
-		TS_LOCK_RESUME;
-
-		/* Since we hold the lock, no other task will change
-		 * ->owner. We can thus check it without acquiring the spin
-		 * lock. */
-		BUG_ON(sem->owner != t);
-	} else {
-		/* it's ours now */
-		sem->owner = t;
-
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
-	}
-
-	sem->owner_cpu = from;
-
-	preempt_enable();
-
-	tsk_rt(t)->num_locks_held++;
-
-	return 0;
-}
-
-int amc_dflp_unlock(struct litmus_lock* l)
-{
-	struct task_struct *t = current, *next;
-	struct dflp_semaphore *sem = dflp_from_lock(l);
-	int err = 0;
-	int home;
-	unsigned long flags;
-
-	preempt_disable();
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	if (sem->owner != t) {
-		err = -EINVAL;
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
-		goto out;
-	}
-
-	/* check if there are jobs waiting for this resource */
-	next = __waitqueue_remove_first(&sem->wait);
-	if (next) {
-		/* next becomes the resouce holder */
-		sem->owner = next;
-
-		/* Wake up next. The waiting job is already priority-boosted. */
-		wake_up_process(next);
-	} else
-		/* resource becomes available */
-		sem->owner = NULL;
-
-	tsk_rt(t)->num_locks_held--;
-
-	home = sem->owner_cpu;
-
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-	/* we lose the benefit of priority boosting */
-	unboost_priority(t);
-
-	amc_migrate_to(home);
-
-out:
-	preempt_enable();
-
-	return err;
-}
-
-int amc_dflp_open(struct litmus_lock* l, void* __user config)
-{
-	struct dflp_semaphore *sem = dflp_from_lock(l);
-	int cpu;
-
-	if (get_user(cpu, (int*) config))
-		return -EFAULT;
-
-	/* make sure the resource location matches */
-	if (cpu != sem->on_cpu)
-		return -EINVAL;
-
-	return 0;
-}
-
-int amc_dflp_close(struct litmus_lock* l)
-{
-	struct task_struct *t = current;
-	struct dflp_semaphore *sem = dflp_from_lock(l);
-	int owner = 0;
-
-	preempt_disable();
-
-	if (sem->on_cpu == smp_processor_id())
-		owner = sem->owner == t;
-
-	preempt_enable();
-
-	if (owner)
-		amc_dflp_unlock(l);
-
-	return 0;
-}
-
-void amc_dflp_free(struct litmus_lock* lock)
-{
-	kfree(dflp_from_lock(lock));
-}
-
-static struct litmus_lock_ops amc_dflp_lock_ops = {
-	.close  = amc_dflp_close,
-	.lock   = amc_dflp_lock,
-	.open	= amc_dflp_open,
-	.unlock = amc_dflp_unlock,
-	.deallocate = amc_dflp_free,
-};
-
-static struct litmus_lock* amc_new_dflp(int on_cpu)
-{
-	struct dflp_semaphore* sem;
-
-	sem = kmalloc(sizeof(*sem), GFP_KERNEL);
-	if (!sem)
-		return NULL;
-
-	sem->litmus_lock.ops = &amc_dflp_lock_ops;
-	sem->owner_cpu = NO_CPU;
-	sem->owner   = NULL;
-	sem->on_cpu  = on_cpu;
-	init_waitqueue_head(&sem->wait);
-
-	return &sem->litmus_lock;
-}
-
-
-/* **** lock constructor **** */
-
-
-static long amc_allocate_lock(struct litmus_lock **lock, int type,
-				 void* __user config)
-{
-	int err = -ENXIO, cpu;
-	struct srp_semaphore* srp;
-
-	/* P-FP currently supports the SRP for local resources and the FMLP
-	 * for global resources. */
-	switch (type) {
-	case FMLP_SEM:
-		/* FIFO Mutex Locking Protocol */
-		*lock = amc_new_fmlp();
-		if (*lock)
-			err = 0;
-		else
-			err = -ENOMEM;
-		break;
-
-	case MPCP_SEM:
-		/* Multiprocesor Priority Ceiling Protocol */
-		*lock = amc_new_mpcp(0);
-		if (*lock)
-			err = 0;
-		else
-			err = -ENOMEM;
-		break;
-
-	case MPCP_VS_SEM:
-		/* Multiprocesor Priority Ceiling Protocol with virtual spinning */
-		*lock = amc_new_mpcp(1);
-		if (*lock)
-			err = 0;
-		else
-			err = -ENOMEM;
-		break;
-
-	case DPCP_SEM:
-		/* Distributed Priority Ceiling Protocol */
-		if (get_user(cpu, (int*) config))
-			return -EFAULT;
-
-		TRACE("DPCP_SEM: provided cpu=%d\n", cpu);
-
-		if (cpu >= NR_CPUS || !cpu_online(cpu))
-			return -EINVAL;
-
-		*lock = amc_new_dpcp(cpu);
-		if (*lock)
-			err = 0;
-		else
-			err = -ENOMEM;
-		break;
-
-	case DFLP_SEM:
-		/* Distributed FIFO Locking Protocol */
-		if (get_user(cpu, (int*) config))
-			return -EFAULT;
-
-		TRACE("DPCP_SEM: provided cpu=%d\n", cpu);
-
-		if (cpu >= NR_CPUS || !cpu_online(cpu))
-			return -EINVAL;
-
-		*lock = amc_new_dflp(cpu);
-		if (*lock)
-			err = 0;
-		else
-			err = -ENOMEM;
-		break;
-
-	case SRP_SEM:
-		/* Baker's Stack Resource Policy */
-		srp = allocate_srp_semaphore();
-		if (srp) {
-			*lock = &srp->litmus_lock;
-			err = 0;
-		} else
-			err = -ENOMEM;
-		break;
-
-        case PCP_SEM:
-		/* Priority Ceiling Protocol */
-		if (!config)
-			cpu = get_partition(current);
-		else if (get_user(cpu, (int*) config))
-			return -EFAULT;
-
-		if (cpu >= NR_CPUS || !cpu_online(cpu))
-			return -EINVAL;
-
-		*lock = amc_new_pcp(cpu);
-		if (*lock)
-			err = 0;
-		else
-			err = -ENOMEM;
-		break;
-	};
-
-	return err;
-}
-
-#endif
-
-static long amc_admit_task(struct task_struct* tsk)
+static long zss_admit_task(struct task_struct* tsk)
 {
 	if (task_cpu(tsk) == tsk->rt_param.task_params.cpu &&
 #ifdef CONFIG_RELEASE_MASTER
@@ -1988,14 +437,14 @@ static long amc_admit_task(struct task_struct* tsk)
 		return -EINVAL;
 }
 
-static struct domain_proc_info amc_domain_proc_info;
-static long amc_get_domain_proc_info(struct domain_proc_info **ret)
+static struct domain_proc_info zss_domain_proc_info;
+static long zss_get_domain_proc_info(struct domain_proc_info **ret)
 {
-	*ret = &amc_domain_proc_info;
+	*ret = &zss_domain_proc_info;
 	return 0;
 }
 
-static void amc_setup_domain_proc(void)
+static void zss_setup_domain_proc(void)
 {
 	int i, cpu;
 	int release_master =
@@ -2007,15 +456,15 @@ static void amc_setup_domain_proc(void)
 	int num_rt_cpus = num_online_cpus() - (release_master != NO_CPU);
 	struct cd_mapping *cpu_map, *domain_map;
 
-	memset(&amc_domain_proc_info, sizeof(amc_domain_proc_info), 0);
-	init_domain_proc_info(&amc_domain_proc_info, num_rt_cpus, num_rt_cpus);
-	amc_domain_proc_info.num_cpus = num_rt_cpus;
-	amc_domain_proc_info.num_domains = num_rt_cpus;
+	memset(&zss_domain_proc_info, sizeof(zss_domain_proc_info), 0);
+	init_domain_proc_info(&zss_domain_proc_info, num_rt_cpus, num_rt_cpus);
+	zss_domain_proc_info.num_cpus = num_rt_cpus;
+	zss_domain_proc_info.num_domains = num_rt_cpus;
 	for (cpu = 0, i = 0; cpu < num_online_cpus(); ++cpu) {
 		if (cpu == release_master)
 			continue;
-		cpu_map = &amc_domain_proc_info.cpu_to_domains[i];
-		domain_map = &amc_domain_proc_info.domain_to_cpus[i];
+		cpu_map = &zss_domain_proc_info.cpu_to_domains[i];
+		domain_map = &zss_domain_proc_info.domain_to_cpus[i];
 
 		cpu_map->id = cpu;
 		domain_map->id = i; /* enumerate w/o counting the release master */
@@ -2025,64 +474,34 @@ static void amc_setup_domain_proc(void)
 	}
 }
 
-static long amc_activate_plugin(void)
+static long zss_activate_plugin(void)
 {
-#if defined(CONFIG_RELEASE_MASTER) || defined(CONFIG_LITMUS_LOCKING)
-	int cpu;
-#endif
-
-#ifdef CONFIG_RELEASE_MASTER
-	for_each_online_cpu(cpu) {
-		remote_dom(cpu)->release_master = atomic_read(&release_master_cpu);
-	}
-#endif
-
-#ifdef CONFIG_LITMUS_LOCKING
-	get_srp_prio = amc_get_srp_prio;
-
-	for_each_online_cpu(cpu) {
-		init_waitqueue_head(&per_cpu(mpcpvs_vspin_wait, cpu));
-		per_cpu(mpcpvs_vspin, cpu) = NULL;
-
-		pcp_init_state(&per_cpu(pcp_state, cpu));
-		amc_doms[cpu] = remote_amc(cpu);
-		per_cpu(fmlp_timestamp,cpu) = 0;
-	}
-
-#endif
-
-	amc_setup_domain_proc();
-
+	zss_setup_domain_proc();
 	return 0;
 }
 
-static long amc_deactivate_plugin(void)
+static long zss_deactivate_plugin(void)
 {
-	destroy_domain_proc_info(&amc_domain_proc_info);
+	destroy_domain_proc_info(&zss_domain_proc_info);
 	return 0;
 }
 
 /*	Plugin object	*/
-static struct sched_plugin amc_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "AMC-FSNR",
-	.task_new		= amc_task_new,
+static struct sched_plugin zss_plugin __cacheline_aligned_in_smp = {
+	.plugin_name		= "AMC-ZSS",
+	.task_new		= zss_task_new,
 	.complete_job		= complete_job,
-	.task_exit		= amc_task_exit,
-	.schedule		= amc_schedule,
-	.task_wake_up		= amc_task_wake_up,
-	.task_block		= amc_task_block,
-	.admit_task		= amc_admit_task,
-	.activate_plugin	= amc_activate_plugin,
-	.deactivate_plugin	= amc_deactivate_plugin,
-	.get_domain_proc_info	= amc_get_domain_proc_info,
-#ifdef CONFIG_LITMUS_LOCKING
-	.allocate_lock		= amc_allocate_lock,
-	.finish_switch		= amc_finish_switch,
-#endif
+	.task_exit		= zss_task_exit,
+	.schedule		= zss_schedule,
+	.task_wake_up		= zss_task_wake_up,
+	.task_block		= zss_task_block,
+	.admit_task		= zss_admit_task,
+	.activate_plugin	= zss_activate_plugin,
+	.deactivate_plugin	= zss_deactivate_plugin,
+	.get_domain_proc_info	= zss_get_domain_proc_info,
 };
 
-
-static int __init init_amc(void)
+static int __init init_zss(void)
 {
 	int i;
 
@@ -2091,9 +510,8 @@ static int __init init_amc(void)
 	 * we cannot use num_online_cpu()
 	 */
 	for (i = 0; i < num_online_cpus(); i++) {
-		amc_domain_init(remote_amc(i), i);
+		zss_domain_init(remote_zss(i), i);
 	}
-	return register_sched_plugin(&amc_plugin);
+	return register_sched_plugin(&zss_plugin);
 }
-
-module_init(init_amc);
+module_init(init_zss);

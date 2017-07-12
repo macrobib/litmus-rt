@@ -452,6 +452,10 @@ static long __litmus_admit_task(struct task_struct* tsk)
 	tsk_rt(tsk)->heap_node = bheap_node_alloc(GFP_ATOMIC);
 	tsk_rt(tsk)->rel_heap = release_heap_alloc(GFP_ATOMIC);
 
+#ifdef CONFIG_AMC_DP
+    tsk_rt(tsk)->dp_prop.dp_node = bheap_node_alloc(GFP_ATOMIC);
+#endif
+
 	if (!tsk_rt(tsk)->heap_node || !tsk_rt(tsk)->rel_heap) {
 		printk(KERN_DEBUG "litmus: no more heap node memory!?\n");
 
@@ -483,6 +487,11 @@ long litmus_admit_task(struct task_struct* tsk)
 
 	tsk_rt(tsk)->heap_node = NULL;
 	tsk_rt(tsk)->rel_heap = NULL;
+
+#ifdef CONFIG_AMC_DP
+    tsk_rt(tsk)->defer_prop = NULL;
+#endif
+
     printk(KERN_DEBUG "Litmus Admit task called..\n");
 	if (get_rt_relative_deadline(tsk) == 0 ||
 	    get_exec_cost(tsk) >
@@ -506,6 +515,10 @@ out:
 			bheap_node_free(tsk_rt(tsk)->heap_node);
 		if (tsk_rt(tsk)->rel_heap)
 			release_heap_free(tsk_rt(tsk)->rel_heap);
+#ifdef CONFIG_AMC_DP 
+        if(tsk_rt(tsk)->defer_prop)
+            bheap_node_free(tsk_rt(tsk)->defer_prop);
+#endif
 	}
 	return retval;
 }
@@ -515,6 +528,10 @@ void litmus_clear_state(struct task_struct* tsk)
     BUG_ON(bheap_node_in_heap(tsk_rt(tsk)->heap_node));
     bheap_node_free(tsk_rt(tsk)->heap_node);
     release_heap_free(tsk_rt(tsk)->rel_heap);
+
+#ifdef CONFIG_AMC_DP
+    bheap_node_free(tsk_rt(tsk)->defer_prop);
+#endif 
 
     atomic_dec(&rt_task_count);
     reinit_litmus_state(tsk, 1);

@@ -286,7 +286,11 @@ struct rt_param {
 	struct bheap_node*	heap_node;
 	struct release_heap*	rel_heap;
 
-	/* Used by rt_domain to queue task in release list.
+#ifdef CONFIF_AMC_DP
+    struct _defer_prop dp_prop;
+#endif
+
+    /* Used by rt_domain to queue task in release list.
 	 */
 	struct list_head list;
 

@@ -1,7 +1,7 @@
 /*
- * litmus/sched_amcdp.c
+ * litmus/sched_amc.c
  *Implementation of Adaptive Mixed Criticality Scheduling Online component.
- *Supporting implementation for AMC Deffered preemption.
+ *Supporting implementation for AMC-max and AMC-rtb. 
  */
 
 #include <linux/percpu.h>
@@ -26,10 +26,10 @@
 
 
 typedef struct {
-	int cpu;
-	rt_domain_t domain;
-	struct fp_prio_queue ready_queue;
-	struct task_struct* scheduled; /* only RT tasks */
+	rt_domain_t 		domain;
+	struct fp_prio_queue	ready_queue;
+	int          		cpu;
+	struct task_struct* 	scheduled; /* only RT tasks */
 /*
  * scheduling lock slock
  * protects the domain and serializes scheduling decisions
@@ -37,122 +37,37 @@ typedef struct {
 #define slock domain.ready_lock
 } amc_domain_t;
 
-/* Abstract timer to handle deferment point. */
-typedef struct{
-    long dp; /*active dp value.*/
-    int armed;
-    struct hrtimer* timer;
-    struct task_struct* t;
-}defer_handler_t;
-defer_handler_t dp_handler;/*Active handler data.*/
-
-/* Core criticality actions. */
+/*Core criticality actions.*/
 typedef enum{
     eLOWER_CRIT,
     eRAISE_CRIT
 }crit_action_t;
 
-/*Task defer states.*/
-typdef enum{
-    ePENDING,
-    eACTIVE,
-    eINACTIVE
-}defer_status_t;
+/*AMC:
+ * Store the tasks dropped from the release queue and runqueue respectively.
+ *Tasks may be left in the undefined state during the criticality drop, to avoid
+ *this tasks need to be allowed to continue back from where they left of, for that
+ *need to save the tasks.
+ * */
+bheap release_queue_bin;
+bheap runqueue_bin;
 
-/*Temporary heap to park low criticality tasks during a criticality change.*/
-static bheap release_queue_bin;
-static bheap deferred_preemption_heap; /*Store the deferred preemption points of newly released jobs.*/
+DEFINE_PER_CPU(amc_domain_t, amc_domains);
 
 /*Single domain variable as single core considered.*/
-static amc_domain_t amc_domain;
+amc_domain_t amc_domain;
 
-/*Maintain deferment state for scheduler plugin.*/
-static defer_status_t amc_defer_status = eINACTIVE;
-static struct task_struct* immediate_task_pick = NULL;
-static struct bheap amc_release_bin[MAX_CRITICALITY_LEVEL];
 /*******************Core MC Changes Start**************************/
+static struct bheap amc_release_bin[MAX_CRITICALITY_LEVEL];
 
-/*Comparison operator for defer point sorting.*/
-static int amc_dp_compare_expiry(struct bheap_node* a, struct bheap_node* b){
-    defer_prop_t* a_dp = container_of(a, defer_prop_t, dp_node);
-    defer_prop_t* b_dp = container_of(b, defer_prop_t, dp_node);
-    return (a_dp->dp) > (b_dp->dp); 
-}
-
-/*Deferment start timer handler.*/
-static enum hrtimer_restart amc_on_dp_timer_expiry(struct hrtimer* timer){
-    defer_prop_t* dptimer = container_of(timer, defer_prop_t, timer);
-    unsigned long flags;
-    
-    local_irq_save(flags);
-    amc_defer_status = ePENDING;
-    immediate_task_pick = dptimer->t;
-    litmus_local_reschedule();
-    local_irq_restore(flags);
-    
-    return HRTIMER_NORESTART;
-}
-
-/*Cancel timer, failure raise a panic.*/
-static void amc_cancel_dp_timer(void){
-    int ret;
-    TRACE("AMC:DP - Cancelling defer timer.\n");
-    if(dp_handler.armed){
-        ret = hrtimer_try_to_cancel(dp_handler.timer);
-        BUG_ON(ret == 0);
-        BUG_ON(ret == -1);
-        dp_handler.armed = 0;
+static int amc_is_task_elgible(struct task_struct* t){
+    int status = 0;
+    if(tsk_rt(t)->task_params.mc_param.criticality >= current_criticality){
+        status = 1;
     }
+    return status;
 }
 
-/*Start a new defer point tracking timer.*/
-static int amc_start_dp_timer(struct task_struct* t, int restart){
-    if(restart)
-        amc_cancel_dp_timer();
-
-    long next_wake_time = litmus_clock() + tsk_rt(t)->defer_prop.dp;
-     __hrtimer_start_range_ms(&(dp_handler.timer), ns_to_ktime(next_wake_time),
-                0, HRTIMER_MODE_ABS_PINNED, 0);
-     dp_handler.armed = 1;
-
-}
-
-/*Defer timer has completed pick new one.*/
-static int amc_pick_next_dp_timer(struct bheap* heap){
-    struct bheap_node* new_node = bheap_take(&deferred_preemption_heap);
-    struct task_struct* next_task = container_of(new_node, struct task_struct, heap_node);
-    amc_start_dp_next_timer(new_task, 0);
-}
-
-/*Timer initalization for defer point tracking.*/
-static void amc_init_dp_handler(void){
-    /*Create hr timer to handle deferred preemption.*/
-    dp_handler.t = NULL;
-    hrtimer_init(&dp_handler.timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
-    dp_handler.timer.function = amc_on_dp_timer_expiry;
-}
-
-/*Update the deferement queue, if a job is released with dp value less than
- * active timer, update the timer.*/
-static void amc_update_defer_points(struct task_struct* t){
-
-    long dp = tsk_rt(t)->task_params.mc_param.dp;
-    struct bheap_node* min_node = bheap_peek(deferred_preemption_heap);
-    struct defer_prop_t* active_dp = container_of(act_dp_task, defer_prop_t, dp_node);
-    if(!min_node){
-        /*No other defer timer active, start the current one.*/
-        amc_start_dp_timer(&(dp_handler.timer), 0);  
-    }
-    else if(tsk_rt(t)->defer_prop.dp < active_dp->dp){
-        /*An earlier defer point exists compared to active one, reset timer.*/
-        amc_start_dp_timer(t, 1);
-    }
-    else{
-        bheap_insert(amc_dp_compare_expiry, deferred_preemption_heap, tsk_rt(t)->heap_node);
-    }
-}
-
-/*Abstracted logic to system criticality.*/
 static int raise_system_criticality(void){
     int status = 0;
     if (current_criticality + 1 < system_criticality){
@@ -164,13 +79,12 @@ static int raise_system_criticality(void){
     return status;
 }
 
-/*Lower the system criticality and move the tasks back to run/release queue.*/
 static void lower_system_criticality(void){
     struct bheap* release_bin;
     rt_domain_t* amc = &(amc_domain.domain);
     if (current_criticality > 0){
         current_criticality -= 1;
-        release_bin = &amc_release_bin[current_criticality];
+        release_bin = &edfvd_release_bin[current_criticality];
         update_release_heap(amc, release_bin, fp_ready_order, 1);
     }
     else{
@@ -178,23 +92,13 @@ static void lower_system_criticality(void){
     }
 }
 
-/*Is task eligible to run in current criticality.*/
-static int amc_is_task_elgible(struct task_struct* t){
-    int status = 0;
-    if(tsk_rt(t)->task_params.mc_param.criticality >= current_criticality){
-        status = 1;
-    }
-    return status;
-}
-
 static int amc_check_criticality(struct bheap_node* node){
     struct task_struct* task = bheap2task(node);
-    return (amc_is_task_eligible(task));
+    return (is_task_elgible(task));
 }
 
 /*Add low crit task to wait queue.*/
 static void add_low_crit_to_wait_queue(struct task_struct* t){
-    
     struct bheap* release_bin = &amc_release_bin[current_criticality - 1];
     bheap_insert(fp_read_order, release_bin, tsk_rt(t)->heap_node);
 }
@@ -205,7 +109,7 @@ int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
     int status = 1;
     int budget_surplus;
     
-    if(amc_is_task_eligible(t)){
+    if(is_task_eligible(t)){
         /*Replenish task if eligible at current criticality.*/
         if(current_criticality >= 1){
             x1 = (tsk_rt(t)->task_params).mc_param.budget[current_criticality];
@@ -238,26 +142,18 @@ static void update_runqueue(){
     TRACE_CUR("Update the runqueue for the current criticality.");
 }
 
-/*Abstracted criticality change related logic.*/
-static int handle_criticality_change(struct task_struct* scheduled){
-    int status = 0;
-    if(is_task_high_crit(scheduled)){/*change criticality only for high crit.*/
-        if(raise_system_criticality()){
-            if(is_task_eligible(scheduled)){
-                status = 1;
-                replenish_task_for_mode(scheduled);
-            }
-            /*Notify user space of criticality change.
-             *TODO: Does low crit task need to know?.
-             * */
-            if(has_control_page(scheduled)){
-                struct control_page* cp = get_control_page(scheduled);
-                cp->active_crit = current_criticality;
-                barrier();
-            }
+static void handle_criticality(struct task_struct* prev){
+    
+    if(check_budget_overrun(prev)){
+        if(!raise_system_criticality()){
+            if(clear_rq_enabled())
+                update_release_queue();
+            update_runqueue(prev);
         }
     }
-    return status;
+    if(is_task_eligible(prev)){
+        replenish_task_for_mode(prev);
+    }
 }
 /*******************Core MC Changes END ***************************/
 
@@ -285,12 +181,9 @@ static void amc_release_jobs(rt_domain_t* rt, struct bheap* tasks)
 		hn = bheap_take(fp_ready_order, tasks);
 		t = bheap2task(hn);
         /*AMC: Only insert the tasks that are eligible for current criticality.*/
-        if(amc_is_task_eligible(t)){
-
+        if(is_task_eligible(t)){
     		TRACE_TASK(t, "released (part:%d prio:%d)\n",
 	    		   get_partition(t), get_priority(t));
-
-            amc_update_defer_points(t);
 		    fp_prio_add(&amc->ready_queue, t, priority_index(t));
         }
         else{
@@ -337,7 +230,6 @@ static void job_completion(struct task_struct* t, int forced)
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
 
 	tsk_rt(t)->completed = 0;
-    amc_pick_next_dp_timer();
 	prepare_for_next_period(t);
 	if (is_released(t, litmus_clock()))
 		sched_trace_task_release(t);
@@ -379,6 +271,7 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 	                     && budget_exhausted(amc->scheduled);
 	np 	    = exists && is_np(amc->scheduled);
 	sleep	    = exists && is_completed(amc->scheduled);
+	migrate     = exists && get_partition(amc->scheduled) != amc->cpu;
 	preempt     = !blocks && (fp_preemption_needed(&amc->ready_queue, prev));
     
     if(exists && !budget_precisely_enforced(amc->scheduled))
@@ -398,32 +291,17 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 	if (blocks)
 		resched = 1;
 
-/*****Scheduling Logic: Start*******************************************/
+    resched = preempt;
+	if (!np && (out_of_time || sleep))
+		request_exit_np(amc->scheduled);
 
-    /*Condition-1: Switch to non-preemptible task state.*/
-    if(!sleep && (amc_defer_status == ePENDING)){
-        amc_defer_status = eACTIVE;
-        if(amc->scheduled != sched_state_task_picked){
-            next = sched_state_task_picked;
-            requeue(amc->scheduled);
-        }
-        else{
-            next = amc->scheduled;
-        }
-        goto dp_active;
-    }
-    /*Condition-2: non-preemptible state of task is active.*/
-    else if(!out_of_time && !sleep && (amc_defer_status == eACTIVE)){
-        goto dp_active;
-    }
-    /*Condition-3: Task is either completed or budget overrun ocurred.*/
-    else if (!np && (out_of_time || sleep)) {
-        amc_defer_status = eINACTIVE;
+	/*Enforcement timer fired, but task did not mark completion.*/
+    if (!np && (out_of_time || sleep)) {
         if(out_of_time){
             BUG_ON(!exists); /*Error scenario, out of time for non existent task.*/
             if(amc_is_task_high_crit(amc->scheduled)){
                 TRACE_TASK("Budget overrun for task (%d)\n", amc->scheduled->pid);
-                if(handle_criticality_change(amc->scheduled)){
+                if(replenish_task_for_mode(amc->scheduled)){
                     /*Task has enough budget to continue execution.*/
                     replenished = 1;
                 }
@@ -450,13 +328,12 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
         }
 	}
     else{
-        /*Condition-4: Could be one of following cases:
+        /*Could be one of following cases:
          * - New Task and subsequently new job being released.
          * - Idle instance.
          * - Awkward scenario when the job is main linux scheduler run queue for too long,
          *   when started in the wait mode of the litmus-rt framework.
          * */
-        amc_defer_status = eINACTIVE;
         if(amc_is_task_eligible(amc->scheduled)){
             job_completion(amc->scheduled, !sleep);
         }
@@ -464,16 +341,15 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
         TRACE_TASK("Task (%d) observed a preemption scenario.\n", amc->scheduled->pid);
     }
 
-/*****Scheduling Logic: End ***********************************************/
-
-/*****Final Scheduling Decision: Start ***********************************/
+	/* The final scheduling decision. Do we need to switch for some reason?
+	 * Switch if we are in RT mode and have no task or if we need to
+	 * resched.
+	 */
 	next = NULL;
-    /*Condition-1: Existing high crit task boosted due to criticality change.*/
-    if(exists && (replenished)){
+    if(exists && replenished){
         /* TODO: Slot to handle priority change after criticality change.  */
         next = prev;
     }
-    /*Condition-2: Pick new task to run, drop low crit tasks in high mode.*/
 	else if (resched || !exists) {
 		/* When preempting a task that does not block, then
 		 * re-insert it into either the ready queue or the
@@ -482,29 +358,37 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 		 */
 		if (amc->scheduled && !blocks)
 			requeue(amc->scheduled, amc);
-        /*Move low crit tasks out of runqueue, while in high crit mode.*/
 		next = fp_prio_take(&amc->ready_queue);
-        while(!amc_is_task_eligible(next) && next){
-            add_low_crit_to_wait_queue(next);
-            next = fp_prio_take(&amc->read_queue);
-        }
-		if (next == prev)
-            TRACE_TASK("Picked previous task again to run: (%d)", next->pid);
+		if (next == prev) {
+			struct task_struct *t = fp_prio_peek(&amc->ready_queue);
+			TRACE_TASK(next, "next==prev sleep=%d oot=%d np=%d preempt=%d migrate=%d "
+				   "boost=%d empty=%d prio-idx=%u prio=%u\n",
+				   sleep, out_of_time, np, preempt, migrate,
+				   is_priority_boosted(next),
+				   t == NULL,
+				   priority_index(next),
+				   get_priority(next));
+			if (t)
+				TRACE_TASK(t, "waiter boost=%d prio-idx=%u prio=%u\n",
+					   is_priority_boosted(t),
+					   priority_index(t),
+					   get_priority(t));
+		}
 		/* If preempt is set, we should not see the same task again. */
 		BUG_ON(preempt && next == prev);
-		/* Similarly, if preempt is set, then next may not be NULL,**/
-		BUG_ON(preempt && next == NULL);
-	}else
+		/* Similarly, if preempt is set, then next may not be NULL,
+		 * unless it's a migration. */
+		BUG_ON(preempt && !migrate && next == NULL);
+	} else
 		/* Only override Linux scheduler if we have a real-time task
 		 * scheduled that needs to continue.
 		 */
 		if (exists)
 			next = prev;
-/*****Final Scheduling Decision: End ***********************************/
 
-	if(next) {
+	if (next) {
 		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
-	}else if (exists) {
+	} else if (exists) {
 		TRACE("becoming idle at %llu\n", litmus_clock());
 #ifdef CONFIG_ENABLE_AMC_RECOVERY
         /*Lower criticality when an idle instance is encountered.*/
@@ -515,12 +399,6 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 	sched_state_task_picked();
 	raw_spin_unlock(&amc->slock);
 	return next;
-/*Early exit in case defer preemption is active.*/
-dp_active:
-    amc->scheduled = next;
-    sched_state_task_picked();
-    raw_spin_unlock(&amc->slock);
-    return next;
 }
 
 #ifdef CONFIG_LITMUS_LOCKING
@@ -698,7 +576,7 @@ static long amc_deactivate_plugin(void)
 
 /*	Plugin object	*/
 static struct sched_plugin amc_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "AMCDP",
+	.plugin_name		= "PTAMC",
 	.task_new		= amc_task_new,
 	.complete_job		= complete_job,
 	.task_exit		= amc_task_exit,
