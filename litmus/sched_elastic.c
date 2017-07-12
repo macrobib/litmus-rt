@@ -28,18 +28,31 @@
 #include <xen/hvc-console.h>
 #endif
 
-/************************* Slack Params: Start *************************/
-/*Enforcement timer to maintain the slack expiration.*/
-struct enforcement_timer slack_timer;
+/************************* Slack Helper: Definitions**************************/
+#define ALLOC_SLACK(slackptr) (slackptr) = kmalloc(sizeof(*(slackptr)), GFP_ATOMIC)
+#define is_task_running(t) ((t)->state == TASK_RUNNING)
+/***********************************************************************/
 
+
+/************************* Slack Params: Start *************************/
+/*Keep track of an immediate pick low task to be used when slack available.*/
+struct task_struct* task_immediate_pick; 
 /*Structure representing a slack instance as a wrapper task.*/
 typedef struct slack{
-    int budget; /*Amount of slack available.*/
-    int period; /*Slack repetition instance*/
-    int state; /*Check if slack is being used or not.*/
-    struct task_struct* task; /*Task using the slack if use is set to active*/
-}slack_t;
+    int budget;
+    int deadline;
+    bheap_node* slack_node;    
+} slack_t;
 
+struct elastic_timer{
+    struct hrtimer timer;
+    struct task_struct* active_task;
+    int armed;
+};
+
+/*Enforcement timer to maintain the slack expiration.*/
+struct elastic_timer slack_timer;
+static struct bheap slack_queue;
 int slack_state = 0; /*Slack state: Expired(0) or Active(1).*/
 /************************* Slack Params: End******************************/
 
@@ -80,20 +93,42 @@ static void elastic_domain_init(elastic_domain_t* elastic,
 
 /*********************Slack handler functions - Start*************************/
 
+/*Check if enough slack exists for an early release of new instance.*/
+static void enough_slack_available(struct task_struct* t){
+    int task_deadline = (t->mc_param).deadline;
+}
+
+/*Provide a scheduler specific handler to insert released job to ready queue.*/
+void elastic_release_job(struct _rt_domain *rt, struct bheap* tasks){
+    update_slack_queue(tasks);
+    merge_ready(rt, tasks);
+}
+
 static enum hrtimer_restart on_slack_timeout(struct hrtimer* timer){
-    struct enforcement_timer* et = container_of(timer, struct enforcement_timer,
-                                    timer);
+    struct elastic_timer* et = container_of(timer, struct elastic_timer, timer);
     unsigned long flags;
+    struct task_struct* t;
+
     local_irq_save(flags);
-    et->armed = 0; /*Slack timer disabled.*/
-    slack_state = 0; /*System no longer in slack usage state.*/
-    litmus_local_reschedule();
-    local_irq_restore(flags);
-    return HRTIMER_NORESTART;
+    t = et->parent_task;
+    /*If the timer owner is active wait till the next early release point.*/
+    if(!is_task_running(t) && enough_slack_available(t)){
+        et->armed = 0;
+        task_immediate_pick = t;
+        litmus_local_reschedule();
+        local_irq_restore(flags);
+        return HRTIMER_NORESTART;
+    }
+    else{
+        task_immediate_pick = NULL;
+        hrtimer_forward(timer, (t->mc_param).early_release);
+        local_irq_restore(flags);
+        return HRTIMER_RESTART;
+    }
 }
 
 /*Creates a slack timer for maintaining slack queues.*/
-static void elastic_init_slack_timer(void){
+static void elastic_init_timers(void){
     
 }
 
@@ -104,21 +139,30 @@ static void elastic_calculate_init_slacks(void){
 
 }
 
+static void insert_slack_node(int deadline, int budget){
+    struct slack* new_node;
+    ALLOC_SLACK(new_node);
+    new_node->budget = budget;
+    new_node->deadline = deadline;
+    new_node->slack_node = bheap_node_alloc(GFP_ATOMIC);
+    bheap_node_init(&new_node, new_node);_
+}
+
+/*Helper function for enabling sorting in bheap.*/
+static void slack_comparator(struct bheap_node* a,struct bheap_node* b){
+    (((struct slack*)a)->deadline) < (((struct slack*)b)->deadline);
+}
+
 /* Update/Merge slack instances, remove expired slack instances.
  * Updation step: For an idle instance check the first element in
  * the release queue, insert a new slack task to queue. If the release
  * task is runnable in given slack, pick and schedule.
  * */
-static void update_slack_queue(void){
-
+static void update_slack_queue(bheap* tasks){
+    
 }
 
-/*Check if enough slack exists for an early release of new instance.*/
-static void check_slack_availability(struct task_struct* t){
-}
 /*********************Slack handler functions - End* *************************/
-
-
 static int raise_system_criticality(void){
     int status = 0;
 
@@ -607,221 +651,8 @@ static void elastic_task_exit(struct task_struct * t)
 	preempt(elastic);
 	raw_spin_unlock_irqrestore(&elastic->slock, flags);
 }
-
-#ifdef CONFIG_LITMUS_LOCKING
-
-#include <litmus/fdso.h>
-#include <litmus/srp.h>
-
-/* ******************** SRP support ************************ */
-
-static unsigned int elastic_get_srp_prio(struct task_struct* t)
-{
-	return get_rt_relative_deadline(t);
-}
-
-/* ******************** FMLP support ********************** */
-
-/* struct for semaphore with priority inheritance */
-struct fmlp_semaphore {
-	struct litmus_lock litmus_lock;
-
-	/* current resource holder */
-	struct task_struct *owner;
-
-	/* FIFO queue of waiting tasks */
-	wait_queue_head_t wait;
-};
-
-static inline struct fmlp_semaphore* fmlp_from_lock(struct litmus_lock* lock)
-{
-	return container_of(lock, struct fmlp_semaphore, litmus_lock);
-}
-int elastic_fmlp_lock(struct litmus_lock* l)
-{
-	struct task_struct* t = current;
-	struct fmlp_semaphore *sem = fmlp_from_lock(l);
-	wait_queue_t wait;
-	unsigned long flags;
-
-	if (!is_realtime(t))
-		return -EPERM;
-
-	/* prevent nested lock acquisition --- not supported by FMLP */
-	if (tsk_rt(t)->num_locks_held ||
-	    tsk_rt(t)->num_local_locks_held)
-		return -EBUSY;
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	if (sem->owner) {
-		/* resource is not free => must suspend and wait */
-
-		init_waitqueue_entry(&wait, t);
-
-		/* FIXME: interruptible would be nice some day */
-		set_task_state(t, TASK_UNINTERRUPTIBLE);
-
-		__add_wait_queue_tail_exclusive(&sem->wait, &wait);
-
-		TS_LOCK_SUSPEND;
-
-		/* release lock before sleeping */
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-		/* We depend on the FIFO order.  Thus, we don't need to recheck
-		 * when we wake up; we are guaranteed to have the lock since
-		 * there is only one wake up per release.
-		 */
-
-		schedule();
-
-		TS_LOCK_RESUME;
-
-		/* Since we hold the lock, no other task will change
-		 * ->owner. We can thus check it without acquiring the spin
-		 * lock. */
-		BUG_ON(sem->owner != t);
-	} else {
-		/* it's ours now */
-		sem->owner = t;
-
-		/* mark the task as priority-boosted. */
-		boost_priority(t);
-
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
-	}
-
-	tsk_rt(t)->num_locks_held++;
-
-	return 0;
-}
-
-int elastic_fmlp_unlock(struct litmus_lock* l)
-{
-	struct task_struct *t = current, *next;
-	struct fmlp_semaphore *sem = fmlp_from_lock(l);
-	unsigned long flags;
-	int err = 0;
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	if (sem->owner != t) {
-		err = -EINVAL;
-		goto out;
-	}
-
-	tsk_rt(t)->num_locks_held--;
-
-	/* we lose the benefit of priority boosting */
-
-	unboost_priority(t);
-
-	/* check if there are jobs waiting for this resource */
-	next = __waitqueue_remove_first(&sem->wait);
-	if (next) {
-		/* boost next job */
-		boost_priority(next);
-
-		/* next becomes the resouce holder */
-		sem->owner = next;
-
-		/* wake up next */
-		wake_up_process(next);
-	} else
-		/* resource becomes available */
-		sem->owner = NULL;
-
-out:
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
-	return err;
-}
-
-int elastic_fmlp_close(struct litmus_lock* l)
-{
-	struct task_struct *t = current;
-	struct fmlp_semaphore *sem = fmlp_from_lock(l);
-	unsigned long flags;
-
-	int owner;
-
-	spin_lock_irqsave(&sem->wait.lock, flags);
-
-	owner = sem->owner == t;
-
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
-
-	if (owner)
-		elastic_fmlp_unlock(l);
-
-	return 0;
-}
-
-void elastic_fmlp_free(struct litmus_lock* lock)
-{
-	kfree(fmlp_from_lock(lock));
-}
-
-static struct litmus_lock_ops elastic_fmlp_lock_ops = {
-	.close  = elastic_fmlp_close,
-	.lock   = elastic_fmlp_lock,
-	.unlock = elastic_fmlp_unlock,
-	.deallocate = elastic_fmlp_free,
-};
-
-static struct litmus_lock* elastic_new_fmlp(void)
-{
-	struct fmlp_semaphore* sem;
-
-	sem = kmalloc(sizeof(*sem), GFP_KERNEL);
-	if (!sem)
-		return NULL;
-
-	sem->owner   = NULL;
-	init_waitqueue_head(&sem->wait);
-	sem->litmus_lock.ops = &elastic_fmlp_lock_ops;
-
-	return &sem->litmus_lock;
-}
-
-/* **** lock constructor **** */
-
-
-static long elastic_allocate_lock(struct litmus_lock **lock, int type,
-				 void* __user unused)
-{
-	int err = -ENXIO;
-	struct srp_semaphore* srp;
-
-	/* PSN-EDF currently supports the SRP for local resources and the FMLP
-	 * for global resources. */
-	switch (type) {
-	case FMLP_SEM:
-		/* Flexible Multiprocessor Locking Protocol */
-		*lock = elastic_new_fmlp();
-		if (*lock)
-			err = 0;
-		else
-			err = -ENOMEM;
-		break;
-
-	case SRP_SEM:
-		/* Baker's Stack Resource Policy */
-		srp = allocate_srp_semaphore();
-		if (srp) {
-			*lock = &srp->litmus_lock;
-			err = 0;
-		} else
-			err = -ENOMEM;
-		break;
-	};
-
-	return err;
-}
-
-#endif
-
 static struct domain_proc_info elastic_domain_proc_info;
+
 static long elastic_get_domain_proc_info(struct domain_proc_info **ret)
 {
 	*ret = &elastic_domain_proc_info;
@@ -861,18 +692,7 @@ static void elastic_setup_domain_proc(void)
 
 static long elastic_activate_plugin(void)
 {
-#ifdef CONFIG_RELEASE_MASTER
-	int cpu;
-
-	for_each_online_cpu(cpu) {
-		remote_edf(cpu)->release_master = atomic_read(&release_master_cpu);
-	}
-#endif
-
-#ifdef CONFIG_LITMUS_LOCKING
-	get_srp_prio = elastic_get_srp_prio;
-#endif
-
+    bheap_init(&slack_queue);
 	elastic_setup_domain_proc();
 
 	return 0;
@@ -909,10 +729,7 @@ static struct sched_plugin psn_edf_plugin __cacheline_aligned_in_smp = {
 	.admit_task		= elastic_admit_task,
 	.activate_plugin	= elastic_activate_plugin,
 	.deactivate_plugin	= elastic_deactivate_plugin,
-	.get_domain_proc_info	= elastic_get_domain_proc_info,
-#ifdef CONFIG_LITMUS_LOCKING
-	.allocate_lock		= elastic_allocate_lock,
-#endif
+	.get_domain_proc_info	= elastic_get_domain_proc_info
 };
 
 
@@ -921,7 +738,7 @@ static int __init init_elastic(void)
     /*Register the schedule domain, still using vestige of pedf scheduler.*/
         current_criticality = 0; /*Reinitializing for plugin switches.*/
 		elastic_domain_init(&local_domain,
-				   elastic_check_resched,NULL, 0);
+				   elastic_check_resched, elastic_release_job, 0);
 	return register_sched_plugin(&psn_edf_plugin);
 }
 

@@ -386,8 +386,7 @@ printk(KERN_ERR"Move task back to low crit.\n");
 }
 
 /*EDFVD: Clear out the tasks from release heap based on the 
- * new criticality change.Brute force way of updating based
- * on looking up all 127 slots one at a time.
+ * new criticality change.
  * */
 void clear_release_heap(rt_domain_t* rt,struct bheap* release_bin,bheap_check_t compare,bheap_prio_t higher_prio){
   struct list_head* pos,*temp = NULL;
