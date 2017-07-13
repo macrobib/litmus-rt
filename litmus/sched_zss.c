@@ -28,7 +28,6 @@
 typedef struct {
 	rt_domain_t 		domain;
 	struct fp_prio_queue	ready_queue;
-	int          		cpu;
 	struct task_struct* 	scheduled; /* only RT tasks */
 /*
  * scheduling lock slock
@@ -38,6 +37,12 @@ typedef struct {
 
 } zss_domain_t;
 
+typedef struct zss_tracker{
+    long zss_instance;
+    struct hrtimer timer;
+    struct task_struct* t;
+}zss_tracker_t;
+
 /*AMC:
  * Store the tasks dropped from the release queue and runqueue respectively.
  *Tasks may be left in the undefined state during the criticality drop, to avoid
@@ -46,9 +51,10 @@ typedef struct {
  * */
 bheap release_queue_bin;
 bheap runqueue_bin;
+zss_tracker_t zss_timer;
+struct task_struct* immediate_schedule;
 
-DEFINE_PER_CPU(zss_domain_t, zss_domains);
-
+zss_domain_t zss_domain;
 zss_domain_t* zss_doms[NR_CPUS];
 
 #define local_zss		(this_cpu_ptr(&zss_domains))
@@ -61,6 +67,13 @@ zss_domain_t* zss_doms[NR_CPUS];
 #ifdef CONFIG_LITMUS_LOCKING
 DEFINE_PER_CPU(uint64_t,fmlp_timestamp);
 #endif
+
+/** ZSS timeout handler. **/
+static enum hrtimer_restart on_zss_timeout(struct hrtimer* timer){
+     zss_tracker_t* tracker = container_of(timer, zss_tracker_t, timer);
+     immediate_schedule = tracker->t;
+     
+}
 
 /* we assume the lock is being held */
 static void preempt(zss_domain_t *zss)
@@ -118,11 +131,9 @@ static void zss_preempt_check(zss_domain_t *zss)
 		preempt(zss);
 }
 
-static void zss_domain_init(zss_domain_t* zss,
-			       int cpu)
+static void zss_domain_init(zss_domain_t* zss)
 {
 	fp_domain_init(&zss->domain, NULL, zss_release_jobs);
-	zss->cpu      		= cpu;
 	zss->scheduled		= NULL;
 	fp_prio_queue_init(&zss->ready_queue);
 }
@@ -159,14 +170,12 @@ static void update_release_queue(){
 
 /*AMC: Update runqueue for current criticality similar to release queue.*/
 static void update_runqueue(){
-    
     bheap_iterate_clear(zss_check_criticality, fp_ready_order,
             &local_zss->domain->release_queue, &release_queue_bin);
     TRACE_CUR("Update the runqueue for the current criticality.");
 }
 
 static void handle_criticality(struct task_struct* prev){
-    
     if(check_budget_overrun(prev)){
         if(!raise_system_criticality()){
             if(clear_rq_enabled())
@@ -186,8 +195,8 @@ static int zss_check_criticality(bheap* node){
 
 /*AMC+: For an idle instance being hit ,criticality need to be
  * reduced. */
-static void reduce_criticality(){
-    
+static inline void reduce_criticality(void){
+   (!criticality) ? BUG_ON(criticality) : (criticality -= 1); 
 }
 
 static struct task_struct* zss_schedule(struct task_struct * prev)
@@ -308,7 +317,7 @@ static struct task_struct* zss_schedule(struct task_struct * prev)
  */
 static void zss_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 {
-	zss_domain_t* 	zss = task_zss(t);
+	zss_domain_t* 	zss = &zss_schedule;
 	unsigned long		flags;
 
 	TRACE_TASK(t, "P-FP: task new, cpu = %d\n",
@@ -333,7 +342,7 @@ static void zss_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 static void zss_task_wake_up(struct task_struct *task)
 {
 	unsigned long		flags;
-	zss_domain_t*		zss = task_zss(task);
+	zss_domain_t* 	zss = &zss_schedule;
 	lt_t			now;
 
 	TRACE_TASK(task, "wake_up at %llu\n", litmus_clock());
@@ -405,15 +414,13 @@ static void zss_task_block(struct task_struct *t)
 static void zss_task_exit(struct task_struct * t)
 {
 	unsigned long flags;
-	zss_domain_t* 	zss = task_zss(t);
-	rt_domain_t*		dom;
+	zss_domain_t* 	zss = &zss_schedule;
 
 	raw_spin_lock_irqsave(&zss->slock, flags);
 	if (is_queued(t)) {
 		BUG(); /* This currently doesn't work. */
 		/* dequeue */
-		dom  = task_dom(t);
-		remove(dom, t);
+		remove(&(zss_domain.domain), t);
 	}
 	if (zss->scheduled == t) {
 		zss->scheduled = NULL;
@@ -509,9 +516,7 @@ static int __init init_zss(void)
 	 * However, if we are so crazy to do so,
 	 * we cannot use num_online_cpu()
 	 */
-	for (i = 0; i < num_online_cpus(); i++) {
-		zss_domain_init(remote_zss(i), i);
-	}
+	zss_domain_init(zss_domain);
 	return register_sched_plugin(&zss_plugin);
 }
 module_init(init_zss);

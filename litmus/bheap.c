@@ -383,3 +383,7 @@ void* bheap_take_del(bheap_prio_t higher_prio,
 	}
 	return ret;
 }
+
+struct bheap_node* bheap_iterate(iterate_cond_t, struct bheap* heap){
+
+}

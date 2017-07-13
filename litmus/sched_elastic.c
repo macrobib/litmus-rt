@@ -31,6 +31,16 @@
 /************************* Slack Helper: Definitions**************************/
 #define ALLOC_SLACK(slackptr) (slackptr) = kmalloc(sizeof(*(slackptr)), GFP_ATOMIC)
 #define is_task_running(t) ((t)->state == TASK_RUNNING)
+
+#define CURRENT_BUDGET(t) ((((tsk_rt(t))->task_params).mc_param).budget[current_criticality])
+#define PREV_BUDGET(t)    ((((tsk_rt(t))->task_params).mc_param).budget[current_criticality - 1])
+
+#define CURRENT_DEADLINE(t) ((((tsk_rt(t))->task_params).mc_param).deadline[current_criticality])
+#define PREV_DEADLINE(t)    ((((tsk_rt(t))->task_params).mc_param).deadline[current_criticality - 1])
+
+#define CURRENT_PERIOD(t) ((((tsk_rt(t))->task_params).mc_param).period[current_criticality])
+#define PREV_PERIOD(t)    ((((tsk_rt(t))->task_params).mc_param).period[current_criticality - 1])
+
 /***********************************************************************/
 
 
@@ -96,6 +106,8 @@ static void elastic_domain_init(elastic_domain_t* elastic,
 /*Check if enough slack exists for an early release of new instance.*/
 static void enough_slack_available(struct task_struct* t){
     int task_deadline = (t->mc_param).deadline;
+    int delta = get_aggregated_delta(task_deadline);
+    return delta >= task_deadline;
 }
 
 /*Provide a scheduler specific handler to insert released job to ready queue.*/
@@ -129,7 +141,10 @@ static enum hrtimer_restart on_slack_timeout(struct hrtimer* timer){
 
 /*Creates a slack timer for maintaining slack queues.*/
 static void elastic_init_timers(void){
-    
+
+    slack_timer->timer;
+    hrtimer_init(&(slack_timer->timer), CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+    (slack_timer->timer).function = on_slack_timeout;
 }
 
 /*Calculate the default slack available in systems.
@@ -225,16 +240,16 @@ int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
         /* 
          * replenishment task if eligible at current criticality.*/
         if(current_criticality >= 1){
-            x1 = tsk_rt(t)->task_params.mc_param.budget[current_criticality];
-            x2 = tsk_rt(t)->task_params.mc_param.budget[current_criticality - 1];
+            x1 = CURRENT_BUDGET(t);
+            x2 = PREV_BUDGET(t)
             budget_surplus = x1 - x2;
 
-            x1 = tsk_rt(t)->task_params.mc_param.deadline[current_criticality];
-            x2 = tsk_rt(t)->task_params.mc_param.deadline[current_criticality - 1];
+            x1 = CURRENT_DEADLINE(t);
+            x2 = PREV_DEADLINE(t);
             deadline_surplus = x1 - x2;
 
-            x1 = tsk_rt(t)->task_params.mc_param.period[current_criticality];
-            x2 = tsk_rt(t)->task_params.mc_param.period[current_criticality - 1];
+            x1 = CURRENT_PERIOD(t);
+            x2 = PREV_PERIOD(t);
             period_surplus = x1 - x2;
         }
         if(action == eRAISE_CRIT){
@@ -321,7 +336,6 @@ static void unboost_priority(struct task_struct* t)
 	BUG_ON(elastic->scheduled != t && is_realtime(t));
 
 	TRACE_TASK(t, "priority restored at %llu\n", now);
-
 	tsk_rt(t)->priority_boosted = 0;
 	tsk_rt(t)->boost_start_time = 0;
 
@@ -416,6 +430,7 @@ static struct task_struct* elastic_schedule(struct task_struct * prev)
                         struct control_page* cp  = get_control_page(elastic->scheduled);
                         cp->active_crit = current_criticality;
                     }
+                    
                     if(replenish_task_for_mode(elastic->scheduled, eRAISE_CRIT)){
                         resched = 0;
                         exists = 1;
