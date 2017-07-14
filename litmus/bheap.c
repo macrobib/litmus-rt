@@ -384,6 +384,20 @@ void* bheap_take_del(bheap_prio_t higher_prio,
 	return ret;
 }
 
-struct bheap_node* bheap_iterate(iterate_cond_t, struct bheap* heap){
 
+/*provide an iteration mode, especially for slack calculation, input bheap node
+ * is updated and current value is returned.*/
+struct bheap_node* bheap_cond_next(bheap_prio_t iterate_cond, struct bheap_node** heap_node){
+    bheap_node* ret = NULL;
+    if(!(*heap_node))
+        return ret;
+    if(iterate_cond(*heap_node, (*heap_node)->next) && (*heap_node)->next){
+        ret = *heap_node;
+        *heap_node = (*heap_node)->next;
+    }
+    return ret;
+}
+
+struct inline bheap_node* bheap_next(struct bheap_node* heap_node){
+    return (!heap_node) ? NULL : (heap_node->next);
 }

@@ -140,6 +140,48 @@ static enum hrtimer_restart on_slack_timeout(struct hrtimer* timer){
     }
 }
 
+/* Duplicated and extended to handle early release points while preparing for
+*  next period.
+*  Release points are: early release points + conservative period.
+*/
+void elastic_prepare_for_next_period(struct task_struct *t)
+{
+	BUG_ON(!t);
+	int processing = 1;
+    lt_t release = get_release(t);
+    lt_t current = litmus_clock();
+
+    while(processing){
+        for(int i = 0; i < TOTAL_PT_POINTS(t); i++){
+         if(release + get_erp(t, i)){
+             release += get_erp(t, i);
+             processing = 0;
+             break;
+             }
+         }
+    }
+	/*Check what is the next early release and update the period.*/
+	release = get_release(t) + get_rt_period(t);
+	/* Record lateness before we set up the next job's
+	  release and deadline. Lateness may be negative.
+	 */
+	t->rt_param.job_params.lateness =
+		(long long)litmus_clock() -
+		(long long)t->rt_param.job_params.deadline;
+
+	if (tsk_rt(t)->sporadic_release) {
+		TRACE_TASK(t, "sporadic release at %llu\n",
+			   tsk_rt(t)->sporadic_release_time);
+		/* sporadic release */
+		setup_release(t, tsk_rt(t)->sporadic_release_time);
+		tsk_rt(t)->sporadic_release = 0;
+	} else {
+		/* periodic release => add period */
+		setup_release(t, release);
+	}
+}
+
+
 /*Creates a slack timer for maintaining slack queues.*/
 static void elastic_init_timers(void){
 
@@ -155,6 +197,13 @@ static void elastic_calculate_init_slacks(void){
 
 }
 
+/*Helper function for enabling sorting in bheap.*/
+static int slack_comparator(struct bheap_node* a,struct bheap_node* b){
+   struct slack* a_slack = container_of(a, struct slack, slack_node);
+   struct slack* b_slack = container_of(a, struct slack, slack_node);
+   return ((a_slack->deadline) < (b_slack->deadline));
+}
+
 static void insert_slack_node(int deadline, int budget){
     struct slack* new_node;
     ALLOC_SLACK(new_node);
@@ -162,11 +211,7 @@ static void insert_slack_node(int deadline, int budget){
     new_node->deadline = deadline;
     new_node->slack_node = bheap_node_alloc(GFP_ATOMIC);
     bheap_node_init(&new_node, new_node);
-}
-
-/*Helper function for enabling sorting in bheap.*/
-static inline int slack_comparator(struct bheap_node* a,struct bheap_node* b){
-   return (((struct slack*)a)->deadline) < (((struct slack*)b)->deadline);
+    bheap_insert(slack_comparator, slack_queue, new_node);
 }
 
 /* Update/Merge slack instances, remove expired slack instances.
@@ -175,7 +220,18 @@ static inline int slack_comparator(struct bheap_node* a,struct bheap_node* b){
  * task is runnable in given slack, pick and schedule.
  * */
 static void update_slack_queue(bheap* tasks){
-    
+ 
+   struct bheap_node* node_iter = tasks->head;
+   lt_t delta = 0;
+   while(node_iter){
+       struct task_struct* t = contained_of(task_node, struct bheap_node,) ;
+       if(is_task_high_crit(t)){
+           delta = HIGH_BUDGET(t) - LOW_BUDGET(t);
+           if(delta)
+               insert_slack_node(delta);
+       } 
+
+   }
 }
 
 /*********************Slack handler functions - End* *************************/
@@ -375,51 +431,10 @@ static void job_completion(struct task_struct* t, int forced)
 {
 	sched_trace_task_completion(t, forced);
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
-
 	tsk_rt(t)->completed = 0;
-	prepare_for_next_period(t);
+	elastic_prepare_for_next_period(t);
 }
 
-/* Duplicated and extended to handle early release points while preparing for
-*  next period.
-*  Release points are: early release points + conservative period.
-*/
-void elastic_prepare_for_next_period(struct task_struct *t)
-{
-	BUG_ON(!t);
-	int processing = 1;
-    lt_t release = get_release(t);
-    lt_t current = litmus_clock();
-
-    while(processing){
-        for(int i = 0; i < TOTAL_PT_POINTS(t); i++){
-         if(release + get_erp(t, i)){
-             release += get_erp(t, i);
-             processing = 0;
-             break;
-             }
-         }
-    }
-	/*Check what is the next early release and update the period.*/
-	release = get_release(t) + get_rt_period(t);
-	/* Record lateness before we set up the next job's
-	  release and deadline. Lateness may be negative.
-	 */
-	t->rt_param.job_params.lateness =
-		(long long)litmus_clock() -
-		(long long)t->rt_param.job_params.deadline;
-
-	if (tsk_rt(t)->sporadic_release) {
-		TRACE_TASK(t, "sporadic release at %llu\n",
-			   tsk_rt(t)->sporadic_release_time);
-		/* sporadic release */
-		setup_release(t, tsk_rt(t)->sporadic_release_time);
-		tsk_rt(t)->sporadic_release = 0;
-	} else {
-		/* periodic release => add period */
-		setup_release(t, release);
-	}
-}
 static struct task_struct* elastic_schedule(struct task_struct * prev)
 {
 	elastic_domain_t* 	elastic = &local_domain;

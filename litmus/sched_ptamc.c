@@ -1,7 +1,6 @@
 /*
- * litmus/sched_amc.c
- *Implementation of Adaptive Mixed Criticality Scheduling Online component.
- *Supporting implementation for AMC-max and AMC-rtb. 
+ * litmus/sched_ptamc.c
+ * Implementation of premption threshold amc scheduling.
  */
 
 #include <linux/percpu.h>
