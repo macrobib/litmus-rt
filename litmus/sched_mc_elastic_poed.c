@@ -858,7 +858,7 @@ static long elastic_admit_task(struct task_struct* tsk)
 
 /*	Plugin object	*/
 static struct sched_plugin psn_edf_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "ELASTIC-POED",
+	.plugin_name		= "E-EDF-POED",
 	.task_new		= elastic_task_new,
 	.complete_job		= complete_job,
 	.task_exit		= elastic_task_exit,
