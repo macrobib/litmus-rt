@@ -777,13 +777,9 @@ static long elastic_deactivate_plugin(void)
 
 static long elastic_admit_task(struct task_struct* tsk)
 {
-	if (task_cpu(tsk) == tsk->rt_param.task_params.cpu
-#ifdef CONFIG_RELEASE_MASTER
-	    /* don't allow tasks on release master CPU */
-	     && task_cpu(tsk) != remote_edf(task_cpu(tsk))->release_master
-#endif
-		)
+	if (task_cpu(tsk) == tsk->rt_param.task_params.cpu){
 		return 0;
+    }
 	else
 		return -EINVAL;
 }

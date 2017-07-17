@@ -66,6 +66,7 @@ struct elastic_timer{
 struct elastic_timer slack_timer;
 static struct bheap slack_queue;
 int slack_state = 0; /*Slack state: Expired(0) or Active(1).*/
+int high_tasks_in_queue = 0; /*Keep count of high tasks in run queue.*/
 /************************* Slack Params: End******************************/
 
 
@@ -105,11 +106,15 @@ static void elastic_domain_init(elastic_domain_t* elastic,
 
 /*********************Slack handler functions - Start*************************/
 
+/*Next immediate release: Get the next immediate release of high crit task.*/
+static inline lt_t next_immediate_release(void){
+}
+
 /*Check if enough slack exists for an early release of new instance.*/
 static void enough_slack_available(struct task_struct* t){
-    int task_deadline = (t->mc_param).deadline;
-    int delta = get_aggregated_delta(task_deadline);
-    return delta >= task_deadline;
+    int required_delta = ((t->mc_param).budget/(t->mc_param).deadline) * (t->mc_param).er_deadline;
+    int available_delta = get_aggregated_delta(task_deadline);
+    return required_delta >= available_delta;
 }
 
 /*Provide a scheduler specific handler to insert released job to ready queue.*/
@@ -133,20 +138,13 @@ static enum hrtimer_restart on_slack_timeout(struct hrtimer* timer){
         local_irq_restore(flags);
         return HRTIMER_NORESTART;
     }
-    else{
-        task_immediate_pick = NULL;
-        hrtimer_forward(timer, (t->mc_param).early_release);
-        local_irq_restore(flags);
-        return HRTIMER_RESTART;
-    }
 }
 
 /* Duplicated and extended to handle early release points while preparing for
 *  next period.
 *  Release points are: early release points + conservative period.
 */
-void elastic_prepare_for_next_period(struct task_struct *t)
-{
+void elastic_prepare_for_next_period(struct task_struct *t){
 	BUG_ON(!t);
 	int processing = 1;
     lt_t release = get_release(t);
@@ -227,6 +225,7 @@ static void update_slack_queue(bheap* tasks){
    while(node_iter){
        struct task_struct* t = contained_of(task_node, struct bheap_node,) ;
        if(is_task_high_crit(t)){
+           high_tasks_in_queue += 1;
            delta = HIGH_BUDGET(t) - LOW_BUDGET(t);
            if(delta)
                insert_slack_node(delta);
@@ -259,7 +258,7 @@ static void lower_system_criticality(void){
         update_release_heap(elastic, release_bin, edf_ready_order, 1);
     }
     else{
-       // TRACE("Bug: Tried to lower criticality below 0.\n");
+        TRACE("Bug: Tried to lower criticality below 0.\n");
     }
 }
 
@@ -328,8 +327,7 @@ int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
     return status;
 }
 
-static void requeue(struct task_struct* t, rt_domain_t *edf)
-{
+static void requeue(struct task_struct* t, rt_domain_t *edf){
 	if (t->state != TASK_RUNNING)
 		TRACE_TASK(t, "requeue: !TASK_RUNNING\n");
 	tsk_rt(t)->completed = 0;
@@ -342,15 +340,13 @@ static void requeue(struct task_struct* t, rt_domain_t *edf)
 }
 
 /* we assume the lock is being held */
-static void preempt(elastic_domain_t *elastic)
-{
+static void preempt(elastic_domain_t *elastic){
 	preempt_if_preemptable(elastic->scheduled, elastic->cpu);
 }
 
 #ifdef CONFIG_LITMUS_LOCKING
 
-static void boost_priority(struct task_struct* t)
-{
+static void boost_priority(struct task_struct* t){
 	unsigned long		flags;
 	elastic_domain_t* 	elastic = &local_domain;
 	lt_t			now;
@@ -378,8 +374,7 @@ static void boost_priority(struct task_struct* t)
 	raw_spin_unlock_irqrestore(&elastic->slock, flags);
 }
 
-static void unboost_priority(struct task_struct* t)
-{
+static void unboost_priority(struct task_struct* t){
 	unsigned long		flags;
 	elastic_domain_t* 	elastic = &local_domain;
 	lt_t			now;
@@ -405,8 +400,7 @@ static void unboost_priority(struct task_struct* t)
 
 #endif
 
-static int elastic_preempt_check(elastic_domain_t *elastic)
-{
+static int elastic_preempt_check(elastic_domain_t *elastic){
 	if (edf_preemption_needed(&elastic->domain, elastic->scheduled)) {
 		preempt(elastic);
 		return 1;
@@ -417,8 +411,7 @@ static int elastic_preempt_check(elastic_domain_t *elastic)
 /* This check is trivial in partioned systems as we only have to consider
  * the CPU of the partition.
  */
-static int elastic_check_resched(rt_domain_t *edf)
-{
+static int elastic_check_resched(rt_domain_t *edf){
 	elastic_domain_t *elastic = container_of(edf, elastic_domain_t, domain);
 
 	/* because this is a callback from rt_domain_t we already hold
@@ -427,16 +420,18 @@ static int elastic_check_resched(rt_domain_t *edf)
 	return elastic_preempt_check(elastic);
 }
 
-static void job_completion(struct task_struct* t, int forced)
-{
+static void job_completion(struct task_struct* t, int forced){
 	sched_trace_task_completion(t, forced);
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
 	tsk_rt(t)->completed = 0;
+    if(is_task_high_crit(t)){
+        if(high_tasks_in_queue)
+            high_tasks_in_queue -= 1;
+    }
 	elastic_prepare_for_next_period(t);
 }
 
-static struct task_struct* elastic_schedule(struct task_struct * prev)
-{
+static struct task_struct* elastic_schedule(struct task_struct * prev){
 	elastic_domain_t* 	elastic = &local_domain;
 	rt_domain_t*		edf  = &elastic->domain;
 	struct task_struct*	next;
@@ -609,8 +604,7 @@ static struct task_struct* elastic_schedule(struct task_struct * prev)
 
 /*	Prepare a task for running in RT mode
  */
-static void elastic_task_new(struct task_struct * t, int on_rq, int is_scheduled)
-{
+static void elastic_task_new(struct task_struct * t, int on_rq, int is_scheduled){
 	rt_domain_t* 		edf  = &local_domain.domain;
 	elastic_domain_t* 	elastic = &local_domain;
 	unsigned long		flags;
@@ -646,8 +640,7 @@ static void elastic_task_new(struct task_struct * t, int on_rq, int is_scheduled
 	raw_spin_unlock_irqrestore(&elastic->slock, flags);
 }
 
-static void elastic_task_wake_up(struct task_struct *task)
-{
+static void elastic_task_wake_up(struct task_struct *task){
 	unsigned long		flags;
 	elastic_domain_t* 	elastic = &local_domain;
 	rt_domain_t* 		edf  = &local_domain.domain;
@@ -693,8 +686,7 @@ static void elastic_task_wake_up(struct task_struct *task)
 	TRACE_TASK(task, "wake up done\n");
 }
 
-static void elastic_task_block(struct task_struct *t)
-{
+static void elastic_task_block(struct task_struct *t){
 	/* only running tasks can block, thus t is in no queue */
 	TRACE_TASK(t, "block at %llu, state=%d\n", litmus_clock(), t->state);
 
@@ -702,8 +694,7 @@ static void elastic_task_block(struct task_struct *t)
 	BUG_ON(is_queued(t));
 }
 
-static void elastic_task_exit(struct task_struct * t)
-{
+static void elastic_task_exit(struct task_struct * t){
 	unsigned long flags;
 	elastic_domain_t* 	elastic = &local_domain;
 	rt_domain_t*		edf;
@@ -724,14 +715,12 @@ static void elastic_task_exit(struct task_struct * t)
 }
 static struct domain_proc_info elastic_domain_proc_info;
 
-static long elastic_get_domain_proc_info(struct domain_proc_info **ret)
-{
+static long elastic_get_domain_proc_info(struct domain_proc_info **ret){
 	*ret = &elastic_domain_proc_info;
 	return 0;
 }
 
-static void elastic_setup_domain_proc(void)
-{
+static void elastic_setup_domain_proc(void){
 	int i, cpu;
 	int release_master =
 #ifdef CONFIG_RELEASE_MASTER
@@ -761,22 +750,19 @@ static void elastic_setup_domain_proc(void)
 	}
 }
 
-static long elastic_activate_plugin(void)
-{
+static long elastic_activate_plugin(void){
     bheap_init(&slack_queue);
 	elastic_setup_domain_proc();
 
 	return 0;
 }
 
-static long elastic_deactivate_plugin(void)
-{
+static long elastic_deactivate_plugin(void){
 	destroy_domain_proc_info(&elastic_domain_proc_info);
 	return 0;
 }
 
-static long elastic_admit_task(struct task_struct* tsk)
-{
+static long elastic_admit_task(struct task_struct* tsk){
 	if (task_cpu(tsk) == tsk->rt_param.task_params.cpu
 #ifdef CONFIG_RELEASE_MASTER
 	    /* don't allow tasks on release master CPU */
@@ -804,8 +790,7 @@ static struct sched_plugin psn_edf_plugin __cacheline_aligned_in_smp = {
 };
 
 
-static int __init init_elastic(void)
-{
+static int __init init_elastic(void){
     /*Register the schedule domain, still using vestige of pedf scheduler.*/
         current_criticality = 0; /*Reinitializing for plugin switches.*/
 		elastic_domain_init(&local_domain,

@@ -38,10 +38,16 @@ typedef struct {
 } zss_domain_t;
 
 typedef struct zss_tracker{
+    int armed;
     long zss_instance;
     struct hrtimer timer;
     struct task_struct* t;
 }zss_tracker_t;
+
+enum timer_action{
+    eSTART,
+    eRESTART,
+};
 
 /*AMC:
  * Store the tasks dropped from the release queue and runqueue respectively.
@@ -52,7 +58,7 @@ typedef struct zss_tracker{
 bheap release_queue_bin;
 bheap runqueue_bin;
 zss_tracker_t zss_timer;
-struct task_struct* immediate_schedule;
+struct task_struct* task_immediate_schedule;
 
 zss_domain_t zss_domain;
 zss_domain_t* zss_doms[NR_CPUS];
@@ -62,7 +68,7 @@ zss_domain_t* zss_doms[NR_CPUS];
 #define remote_zss(cpu)	(&per_cpu(zss_domains, cpu))
 #define task_dom(task)		remote_dom(get_partition(task))
 #define task_zss(task)		remote_zss(get_partition(task))
-
+#define ZSS_INSTANCE(t) (((tsk_rt(t))->mc_param).zss_instance) 
 
 #ifdef CONFIG_LITMUS_LOCKING
 DEFINE_PER_CPU(uint64_t,fmlp_timestamp);
@@ -70,9 +76,39 @@ DEFINE_PER_CPU(uint64_t,fmlp_timestamp);
 
 /** ZSS timeout handler. **/
 static enum hrtimer_restart on_zss_timeout(struct hrtimer* timer){
+
+     unsigned long flags;
+     local_irq_save(flags);
      zss_tracker_t* tracker = container_of(timer, zss_tracker_t, timer);
-     immediate_schedule = tracker->t;
-     
+     task_immediate_schedule = tracker->t;
+     litmus_reschedule_local(); 
+     local_irq_restore(flags);
+     return HRTIMER_NORESTART;
+}
+
+static void zss_stop_timer(struct task_struct* t){
+    if(t != zss_timer.t)
+        TRACE("zss timer stoped by task differing from startin task.\n");
+    if(!hrtimer_try_to_cancel(zss_timer.timer))
+        TRACE("tried to cancel inactive zss timer.\n");
+}
+
+static int zss_start_timer(struct task_struct* t, enum timer_action action){
+    lt_t zss_instance;
+    if(action == eSTART){
+        if(zss_timer.armed)
+            hrtimer_try_to_cancel(&(zss_timer.timer));
+        zss_instance = litmus_clock() + ZSS_INSTANCE(t);
+        __hrtimer_start_range_ns(&(zss_timer.timer), ns_to_ktime(zss_instance),
+                0, HRTIMER_MODE_ABS_PINNED, 0);
+        zss_timer.armed = 1;
+    }
+    else if(action == eRESTART){
+        /*Offset update.*/
+    }
+    else{
+        BUG_ON("Invalid timer action.\n");
+    }
 }
 
 /* we assume the lock is being held */
