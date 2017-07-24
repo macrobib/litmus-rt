@@ -4,7 +4,6 @@
  * Heavy lifting of determining the task constrains and index assignment
  * done in liblitmus.
  */
-
 #include <linux/percpu.h>
 #include <linux/sched.h>
 #include <linux/list.h>
@@ -26,7 +25,6 @@
 #include <linux/uaccess.h>
 
 #define TOTAL_SKIP_COUNT 32 /*Limit to contrained tasks.*/
-#define BOOSTED (1) /*mark to user space of task criticality being boosted.*/
 typedef struct {
 	rt_domain_t 		domain;
 	struct fp_prio_queue	ready_queue;
@@ -42,30 +40,24 @@ typedef struct {
 DEFINE_PER_CPU(icg_domain_t, icg_domains);
 /*Local structure abstracting the scheduler.*/
 icg_domain_t icg_domain;
-icg_domain_t* icg_doms[NR_CPUS];
 /*Saves the task structure corresponding to each icg index value specified
  *in mc_param structure.
  * */
 struct task_struct* constrained_indexed_tasks[TOTAL_SKIP_COUNT];
 
-#define local_icg		(this_cpu_ptr(&icg_domains))
-#define remote_dom(cpu)		(&per_cpu(icg_domains, cpu).domain)
-#define remote_icg(cpu)	(&per_cpu(icg_domains, cpu))
-#define task_dom(task)		remote_dom(get_partition(task))
-#define task_icg(task)		remote_icg(get_partition(task))
-
-
-#ifdef CONFIG_LITMUS_LOCKING
-DEFINE_PER_CPU(uint64_t,fmlp_timestamp);
-#endif
-
 /**********************ICG Helper functions.********************************/
 
-static inline void icg_update_control_page(struct task_struct* t, int flag){
+static inline void icg_update_userspace(struct task_struct* t, int flag){
     if(has_control_page(t)){
         struct control_page* cp = get_control_page(t);
         cp->active_crit = flag;
+        barrier();
     }
+}
+
+/*Check if task is marked for skipping or not.*/
+static inline unsigned int icg_is_task_eligible(struct task_struct* t){
+    return (tsk_rt(t)->task_params.mc_param.skip == 0);
 }
 
 /*Mark all the constrained tasks for given task with the new mask.
@@ -83,18 +75,16 @@ static int icg_mark_overridden_tasks(struct task_struct* t, int mask){
         }
     }
     if(count)
-        icg_update_control_page(t, flag);/*user space update.*/
+        icg_update_userspace(t, flag);/*update control page to notify userspace of crit change..*/
     return count;
 }
-
-
 
 /*Replenish task for a mode change, return 1 if task has budget in new mode.*/
 static int icg_replenish_task_for_mode(struct task_struct* t, int mode){
     int status = 1;
     int x1 = 0, x2 = 0;
     int budget_surplus = 0;
-    if(is_task_eligible(t)){
+    if(icg_is_task_eligible(t)){
         x1 = tsk_rt(t)->task_params.mc_param.budget[1];
         x2 = tsk_rt(t)->task_params.mc_param.budget[0];
         budget_surplus = x1 - x2;
@@ -120,11 +110,6 @@ static void preempt(icg_domain_t *icg)
 static unsigned int priority_index(struct task_struct* t)
 {
 	return get_priority(t);
-}
-
-/*Check if task is marked for skipping or not.*/
-static unsigned int icg_is_task_eligible(struct task_struct* t){
-    return (tsk_rt(t)->task_params.mc_param.skip == 0);
 }
 
 static void icg_release_jobs(rt_domain_t* rt, struct bheap* tasks)
@@ -325,6 +310,7 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 			next = prev;
 
 	if (next) {
+        icg_update_userspace(next);
 		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
 	} else if (exists) {
 		TRACE("becoming idle at %llu\n", litmus_clock());
@@ -360,7 +346,6 @@ static void icg_finish_switch(struct task_struct *prev)
 			preempt(to);
 
 		raw_spin_unlock(&to->slock);
-
 	}
 }
 
@@ -526,23 +511,7 @@ static void icg_setup_domain_proc(void)
 
 static long icg_activate_plugin(void)
 {
-#if defined(CONFIG_RELEASE_MASTER) || defined(CONFIG_LITMUS_LOCKING)
-	int cpu;
-#endif
-
-#ifdef CONFIG_LITMUS_LOCKING
-	get_srp_prio = icg_get_srp_prio;
-	for_each_online_cpu(cpu) {
-		init_waitqueue_head(&per_cpu(mpcpvs_vspin_wait, cpu));
-		per_cpu(mpcpvs_vspin, cpu) = NULL;
-
-		pcp_init_state(&per_cpu(pcp_state, cpu));
-		icg_doms[cpu] = remote_icg(cpu);
-		per_cpu(fmlp_timestamp,cpu) = 0;
-	}
-#endif
 	icg_setup_domain_proc();
-
 	return 0;
 }
 

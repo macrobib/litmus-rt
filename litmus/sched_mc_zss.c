@@ -34,45 +34,43 @@ typedef struct {
  * protects the domain and serializes scheduling decisions
  */
 #define slock domain.ready_lock
-
 } zss_domain_t;
 
 typedef struct zss_tracker{
     int armed;
-    long zss_instance;
+    lt_t zss_time;
     struct hrtimer timer;
     struct task_struct* t;
 }zss_tracker_t;
+
+typedef struct zss_instance{
+    lt_t activation;
+    struct task_struct* t;
+}
 
 enum timer_action{
     eSTART,
     eRESTART,
 };
 
-/*AMC:
- * Store the tasks dropped from the release queue and runqueue respectively.
- *Tasks may be left in the undefined state during the criticality drop, to avoid
- *this tasks need to be allowed to continue back from where they left of, for that
- *need to save the tasks.
- * */
-bheap release_queue_bin;
+/*System modes in zero slack approach.*/
+enum system_mode{
+    eNORMAL,
+    eCRITICAL,
+};
+
+/*In critical mode, move park low crit tasks to runqueue bin.*/
 bheap runqueue_bin;
-zss_tracker_t zss_timer;
-struct task_struct* task_immediate_schedule;
+zss_tracker_t zss_timer;/*Timer instance.*/
+struct task_struct* task_immediate_schedule; /*Marks the  current active zero slack instance.*/
+zss_domain_t zss_domain; /*Scheduler abstraction.*/
+bheap zss_instances; /*Saves the active zero slack instances in increasing order of expiry*/
 
-zss_domain_t zss_domain;
-zss_domain_t* zss_doms[NR_CPUS];
+#define ZSS_ACTIVATION_TIME(t) (((tsk_rt(t))->mc_param).zss_time)
+/*Runs timer for next expiring zero slack instance.*/
+static void start_next_timer(void){
 
-#define local_zss		(this_cpu_ptr(&zss_domains))
-#define remote_dom(cpu)		(&per_cpu(zss_domains, cpu).domain)
-#define remote_zss(cpu)	(&per_cpu(zss_domains, cpu))
-#define task_dom(task)		remote_dom(get_partition(task))
-#define task_zss(task)		remote_zss(get_partition(task))
-#define ZSS_INSTANCE(t) (((tsk_rt(t))->mc_param).zss_instance) 
-
-#ifdef CONFIG_LITMUS_LOCKING
-DEFINE_PER_CPU(uint64_t,fmlp_timestamp);
-#endif
+}
 
 /** ZSS timeout handler. **/
 static enum hrtimer_restart on_zss_timeout(struct hrtimer* timer){
@@ -80,6 +78,7 @@ static enum hrtimer_restart on_zss_timeout(struct hrtimer* timer){
      unsigned long flags;
      local_irq_save(flags);
      zss_tracker_t* tracker = container_of(timer, zss_tracker_t, timer);
+     raise_system_criticality();
      task_immediate_schedule = tracker->t;
      litmus_reschedule_local(); 
      local_irq_restore(flags);
@@ -94,17 +93,22 @@ static void zss_stop_timer(struct task_struct* t){
 }
 
 static int zss_start_timer(struct task_struct* t, enum timer_action action){
-    lt_t zss_instance;
+    lt_t zss_timer_start;
     if(action == eSTART){
         if(zss_timer.armed)
             hrtimer_try_to_cancel(&(zss_timer.timer));
-        zss_instance = litmus_clock() + ZSS_INSTANCE(t);
-        __hrtimer_start_range_ns(&(zss_timer.timer), ns_to_ktime(zss_instance),
+        zss_timer_start = litmus_clock() + ZSS_ACTIVATION_TIME(t);
+        __hrtimer_start_range_ns(&(zss_timer.timer), ns_to_ktime(zss_timer_start),
                 0, HRTIMER_MODE_ABS_PINNED, 0);
         zss_timer.armed = 1;
     }
     else if(action == eRESTART){
         /*Offset update.*/
+        hrtimer_try_to_cancel(&(zss_timer.timer));
+        zss_timer_start = litmus_clock() + ZSS_ACTIVATION_TIME(t);
+        __hrtimer_start_range_ns(&(zss_timer.timer), ns_to_ktime(zss_timer_start),
+                0, HRTIMER_MODE_ABS_PINNED, 0);
+        zss_timer.armed = 1;
     }
     else{
         BUG_ON("Invalid timer action.\n");
@@ -115,6 +119,15 @@ static int zss_start_timer(struct task_struct* t, enum timer_action action){
 static void preempt(zss_domain_t *zss)
 {
 	preempt_if_preemptable(zss->scheduled, zss->cpu);
+}
+
+/*Update control page to notify userspace of criticality change.*/
+static inline void zss_update_userspace(struct task_struct* t){
+   if(has_control_page(t)){
+       struct control_page* cp = get_control_page(t);
+       cp->active_crit = flag;
+       barrier();
+   } 
 }
 
 static unsigned int priority_index(struct task_struct* t)
@@ -200,14 +213,14 @@ static void job_completion(struct task_struct* t, int forced)
  * to a temporary queue to be moved back when returning back
  * to prev criticality*/
 static void update_release_queue(){
-    clear_release_heap(&local_zss->domain, &release_queue_bin, zss_check_criticality, fp_ready_order);
+    clear_release_heap(&zss_domain->domain, &release_queue_bin, zss_check_criticality, fp_ready_order);
     TRACE_CUR("Updated the release queue for the current criticality.");
 }
 
 /*AMC: Update runqueue for current criticality similar to release queue.*/
 static void update_runqueue(){
     bheap_iterate_clear(zss_check_criticality, fp_ready_order,
-            &local_zss->domain->release_queue, &release_queue_bin);
+            &zss_domain->domain->release_queue, &release_queue_bin);
     TRACE_CUR("Update the runqueue for the current criticality.");
 }
 
@@ -229,23 +242,21 @@ static int zss_check_criticality(bheap* node){
     return (is_task_eligible(node));
 }
 
-/*AMC+: For an idle instance being hit ,criticality need to be
- * reduced. */
+/*Main schedule function. If an idle instance is encountered, reduce criticality. */
 static inline void reduce_criticality(void){
    (!criticality) ? BUG_ON(criticality) : (criticality -= 1); 
 }
 
 static struct task_struct* zss_schedule(struct task_struct * prev)
 {
-	zss_domain_t* 	zss = local_zss;
+	zss_domain_t* 	zss = zss_domain;
 	struct task_struct*	next;
     
-	int out_of_time, sleep, preempt, np, exists, blocks, resched, migrate;
+	int out_of_time, sleep, preempt, np, exists, blocks, resched;
 
 	raw_spin_lock(&zss->slock);
 
 	/* sanity checking
-	 * differently from gedf, when a task exits (dead)
 	 * zss->schedule may be null and prev _is_ realtime
 	 */
 	BUG_ON(zss->scheduled && zss->scheduled != prev);
@@ -258,95 +269,117 @@ static struct task_struct* zss_schedule(struct task_struct * prev)
 	                     && budget_exhausted(zss->scheduled);
 	np 	    = exists && is_np(zss->scheduled);
 	sleep	    = exists && is_completed(zss->scheduled);
-	migrate     = exists && get_partition(zss->scheduled) != zss->cpu;
-	preempt     = !blocks && (migrate || fp_preemption_needed(&zss->ready_queue, prev));
+	preempt     = !blocks && (fp_preemption_needed(&zss->ready_queue, prev));
 
-#ifdef ENABLE_AMC
-    /*Main logical components of the AMC are part of the offline strategies.
-     *Runtime mechanism involves monitoring the budget usage, transitioning
-     *and recovery from High critical stages.
-     * */
-    handle_criticality(prev);
-#endif
+    if(system_mode == ePENDING){
+        /*Drop low critical tasks.*/
+        prepare_for_next_period(zss->scheduled);
+        next = sched_state_task_picked;
+        system_mode == eCRITICAL;
+        zss_update_userspace(next);
+        goto completed;
+    }
+    else{
 
-	/* If we need to preempt do so.
-	 * The following checks set resched to 1 in case of special
-	 * circumstances.
-	 */
-	resched = preempt;
+        /*Debug: Check for schedule failure.*/
+        if(budget_exhausted(zss->scheduled)){
+            if(system_mode == eCRITICAL)
+                TRACE("ZSS: Schedule failure - Budget overrun in critical mode.\n");
+            else
+                TRACE("ZSS: Budget overrun.");
+        }
+        /* If we need to preempt do so.
+         * The following checks set resched to 1 in case of special
+         * circumstances.
+         */
+        resched = preempt;
+        /* If a task blocks we have no choice but to reschedule.
+         */
+        if (blocks)
+            resched = 1;
+        /* Request a sys_exit_np() call if we would like to preempt but cannot.
+         * Multiple calls to request_exit_np() don't hurt.
+         */
+        if (np && (out_of_time || preempt || sleep))
+            request_exit_np(zss->scheduled);
+        /* Any task that is preemptable and either exhausts its execution
+         * budget or wants to sleep completes. We may have to reschedule after
+         * this.
+         */
+        if (!np && (out_of_time || sleep)) {
+            job_completion(zss->scheduled, !sleep);
+            resched = 1;
+        }
+        /* The final scheduling decision. Do we need to switch for some reason?
+         * Switch if we are in RT mode and have no task or if we need to
+         * resched.
+         */
+        next = NULL;
+        if ((!np || blocks) && (resched || !exists)) {
+            /* When preempting a task that does not block, then
+             * re-insert it into either the ready queue or the
+             * release queue (if it completed). requeue() picks
+             * the appropriate queue.
+             */
+            if (zss->scheduled && !blocks)
+                requeue(zss->scheduled, zss);
+            /*If in CRITICAL mode, move low task to runqueue bin.*/
+            while(!next){
+                next = fp_prio_take(&zss->ready_queue);
+                if(is_task_eligible(next))
+                    break;
+                else{
+                    add_low_crit_to_wait_queue(next);
+                    next = NULL;
+                }
+            }
 
-	/* If a task blocks we have no choice but to reschedule.
-	 */
-	if (blocks)
-		resched = 1;
+            if (next == prev) {
+                struct task_struct *t = fp_prio_peek(&zss->ready_queue);
+                TRACE_TASK(next, "next==prev sleep=%d oot=%d np=%d preempt=%d "
+                       "boost=%d empty=%d prio-idx=%u prio=%u\n",
+                       sleep, out_of_time, np, preempt,
+                       is_priority_boosted(next),
+                       t == NULL,
+                       priority_index(next),
+                       get_priority(next));
+                if (t)
+                    TRACE_TASK(t, "waiter boost=%d prio-idx=%u prio=%u\n",
+                           is_priority_boosted(t),
+                           priority_index(t),
+                           get_priority(t));
+            }
+            /* If preempt is set, we should not see the same task again. */
+            BUG_ON(preempt && next == prev);
+            /* Similarly, if preempt is set, then next may not be NULL,
+             * unless it's a migration. */
+            BUG_ON(preempt && next == NULL);
+        } else
+            /* Only override Linux scheduler if we have a real-time task
+             * scheduled that needs to continue.
+             */
+            if (exists)
+                next = prev;
 
-	/* Request a sys_exit_np() call if we would like to preempt but cannot.
-	 * Multiple calls to request_exit_np() don't hurt.
-	 */
-	if (np && (out_of_time || preempt || sleep))
-		request_exit_np(zss->scheduled);
+        if (next) {
+            zss_update_userspace(next);
+            TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
+        } else if (exists) {
+            TRACE("becoming idle at %llu\n", litmus_clock());
+        }
+        
+        zss->scheduled = next;
+        sched_state_task_picked();
+        raw_spin_unlock(&zss->slock);
+    }
+return next;
 
-	/* Any task that is preemptable and either exhausts its execution
-	 * budget or wants to sleep completes. We may have to reschedule after
-	 * this.
-	 */
-	if (!np && (out_of_time || sleep)) {
-		job_completion(zss->scheduled, !sleep);
-		resched = 1;
-	}
-
-	/* The final scheduling decision. Do we need to switch for some reason?
-	 * Switch if we are in RT mode and have no task or if we need to
-	 * resched.
-	 */
-	next = NULL;
-	if ((!np || blocks) && (resched || !exists)) {
-		/* When preempting a task that does not block, then
-		 * re-insert it into either the ready queue or the
-		 * release queue (if it completed). requeue() picks
-		 * the appropriate queue.
-		 */
-		if (zss->scheduled && !blocks  && !migrate)
-			requeue(zss->scheduled, zss);
-		next = fp_prio_take(&zss->ready_queue);
-		if (next == prev) {
-			struct task_struct *t = fp_prio_peek(&zss->ready_queue);
-			TRACE_TASK(next, "next==prev sleep=%d oot=%d np=%d preempt=%d migrate=%d "
-				   "boost=%d empty=%d prio-idx=%u prio=%u\n",
-				   sleep, out_of_time, np, preempt, migrate,
-				   is_priority_boosted(next),
-				   t == NULL,
-				   priority_index(next),
-				   get_priority(next));
-			if (t)
-				TRACE_TASK(t, "waiter boost=%d prio-idx=%u prio=%u\n",
-					   is_priority_boosted(t),
-					   priority_index(t),
-					   get_priority(t));
-		}
-		/* If preempt is set, we should not see the same task again. */
-		BUG_ON(preempt && next == prev);
-		/* Similarly, if preempt is set, then next may not be NULL,
-		 * unless it's a migration. */
-		BUG_ON(preempt && !migrate && next == NULL);
-	} else
-		/* Only override Linux scheduler if we have a real-time task
-		 * scheduled that needs to continue.
-		 */
-		if (exists)
-			next = prev;
-
-	if (next) {
-		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
-	} else if (exists) {
-		TRACE("becoming idle at %llu\n", litmus_clock());
-	}
-
-	zss->scheduled = next;
-	sched_state_task_picked();
-	raw_spin_unlock(&zss->slock);
-
-	return next;
+/*Early completion on transition at a zero slack instance.*/
+completed:
+    zss_scheduled = next;
+    sched_state_task_picked();
+    raw_spin_unlock(&zss->slock);
+    return next;
 }
 
 /*	Prepare a task for running in RT mode
@@ -470,10 +503,6 @@ static void zss_task_exit(struct task_struct * t)
 static long zss_admit_task(struct task_struct* tsk)
 {
 	if (task_cpu(tsk) == tsk->rt_param.task_params.cpu &&
-#ifdef CONFIG_RELEASE_MASTER
-	    /* don't allow tasks on release master CPU */
-	    task_cpu(tsk) != remote_dom(task_cpu(tsk))->release_master &&
-#endif
 	    litmus_is_valid_fixed_prio(get_priority(tsk)))
 		return 0;
 	else

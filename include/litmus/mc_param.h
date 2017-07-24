@@ -5,6 +5,9 @@
 
 struct mc_task{
     unsigned int criticality;
+#ifdef CONFIG_MC_FP
+    unsigned int prio;
+#endif
     unsigned long period[MAX_CRITICALITY_LEVEL];
     unsigned long budget[MAX_CRITICALITY_LEVEL];
     unsigned long deadline[MAX_CRITICALITY_LEVEL];
@@ -15,6 +18,9 @@ struct mc_task{
 #endif
 #ifdef CONFIG_AMCDP
     unsigned long dp;
+#endif
+#ifdef CONFIG_AMCPT
+    unsigned int pt;
 #endif
 
 };

@@ -51,7 +51,9 @@ typedef enum{
 bheap release_queue_bin;
 bheap runqueue_bin;
 
-DEFINE_PER_CPU(amc_domain_t, amc_domains);
+/*Boost and lower priority to and from preemption threshold value.*/
+#define BOOST_PRIO_TO_PT(t) (tsk_rt(t)->task_params.priority = tsk_rt(t)->task_params.mc_params.pt) 
+#define RESET_PRIO(t) (tsk_rt(t)->task_params.priority = tsk_rt(t)->task_params.mc_params.prio)
 
 /*Single domain variable as single core considered.*/
 amc_domain_t amc_domain;
@@ -217,6 +219,7 @@ static void amc_domain_init(amc_domain_t* amc,
 static void requeue(struct task_struct* t, amc_domain_t *amc)
 {
 	tsk_rt(t)->completed = 0;
+    RESET_PRIO(t);
 	if (is_released(t, litmus_clock()))
 		fp_prio_add(&amc->ready_queue, t, priority_index(t));
 	else
@@ -227,7 +230,7 @@ static void job_completion(struct task_struct* t, int forced)
 {
 	sched_trace_task_completion(t, forced);
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
-
+    RESET_PRIO(t);
 	tsk_rt(t)->completed = 0;
 	prepare_for_next_period(t);
 	if (is_released(t, litmus_clock()))
@@ -386,6 +389,7 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 			next = prev;
 
 	if (next) {
+        BOOST_PRIO_TO_PT(next);
 		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
 	} else if (exists) {
 		TRACE("becoming idle at %llu\n", litmus_clock());
