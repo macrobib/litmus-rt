@@ -99,14 +99,6 @@ static  void __bheap_min(bheap_prio_t higher_prio, struct bheap* heap,
 	}
 }
 
-/*Get next parameter in bheap if condition is satisfied else return NULL.*/
-static void bheap_conditional_next(bheap_prio_t search_cond, struct bheap* heap,  struct bheap_node** node){
-    
-    *node = NULL;
-    if(search_cond(heap, heap->next))
-        *node = heap->next;
-}
-
 /*EDFVD: Iterate and clear an entire bheap data structure.
  * */
 void bheap_iterate_delete(bheap_prio_t higher_prio,struct bheap* heap)
@@ -384,11 +376,10 @@ void* bheap_take_del(bheap_prio_t higher_prio,
 	return ret;
 }
 
-
 /*provide an iteration mode, especially for slack calculation, input bheap node
  * is updated and current value is returned.*/
 struct bheap_node* bheap_cond_next(bheap_prio_t iterate_cond, struct bheap_node** heap_node){
-    bheap_node* ret = NULL;
+    struct bheap_node* ret = NULL;
     if(!(*heap_node))
         return ret;
     if(iterate_cond(*heap_node, (*heap_node)->next) && (*heap_node)->next){
@@ -398,6 +389,7 @@ struct bheap_node* bheap_cond_next(bheap_prio_t iterate_cond, struct bheap_node*
     return ret;
 }
 
-struct inline bheap_node* bheap_next(struct bheap_node* heap_node){
+inline struct bheap_node* bheap_next(struct bheap_node* heap_node){
     return (!heap_node) ? NULL : (heap_node->next);
 }
+
