@@ -26,7 +26,8 @@ obj-y     = sched_plugin.o litmus.o \
 
 # MC plugin files.
 obj-y += sched_mc_edfvd.o \
-		sched_mc_amc.o
+		sched_mc_amc.o\
+	#	sched_mc_amcdp.o
 
 obj-$(CONFIG_PLUGIN_CEDF) += sched_cedf.o
 obj-$(CONFIG_PLUGIN_PFAIR) += sched_pfair.o

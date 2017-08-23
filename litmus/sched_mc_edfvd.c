@@ -109,7 +109,7 @@ static int raise_hypercall(void){
 }
 #endif
 
-int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
+static int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
     
     int x1 = 0, x2 = 0;
     int status = 1;

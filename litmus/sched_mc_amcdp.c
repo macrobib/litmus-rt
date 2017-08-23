@@ -47,27 +47,27 @@ typedef struct{
 defer_handler_t dp_handler;/*Active handler data.*/
 
 /* Core criticality actions. */
-typedef enum{
+enum crit_action_t{
     eLOWER_CRIT,
     eRAISE_CRIT
-}crit_action_t;
+};
 
 /*Task defer states.*/
-typdef enum{
+enum defer_status_t{
     ePENDING,
     eACTIVE,
     eINACTIVE
-}defer_status_t;
+};
 
 /*Temporary heap to park low criticality tasks during a criticality change.*/
-static bheap release_queue_bin;
-static bheap deferred_preemption_heap; /*Store the deferred preemption points of newly released jobs.*/
+static struct bheap release_queue_bin;
+static struct bheap deferred_preemption_heap; /*Store the deferred preemption points of newly released jobs.*/
 
 /*Single domain variable as single core considered.*/
 static amc_domain_t amc_domain;
 
 /*Maintain deferment state for scheduler plugin.*/
-static defer_status_t amc_defer_status = eINACTIVE;
+static enum defer_status_t amc_defer_status = eINACTIVE;
 static struct task_struct* immediate_task_pick = NULL;
 static struct bheap amc_release_bin[MAX_CRITICALITY_LEVEL];
 /*******************Core MC Changes Start**************************/
@@ -178,7 +178,7 @@ static void lower_system_criticality(void){
 }
 
 /*Is task eligible to run in current criticality.*/
-static int amc_is_task_elgible(struct task_struct* t){
+static int is_task_eligible(struct task_struct* t){
     int status = 0;
     if(tsk_rt(t)->task_params.mc_param.criticality >= current_criticality){
         status = 1;
@@ -223,7 +223,7 @@ int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
             }
         }
         else{
-            TRACE_TASK("Undefined replenishment called for (%d)\n", t->pid);
+            TRACE_TASK(t, "Undefined replenishment called for (%d)\n", t->pid);
         }
     }
     return status;
@@ -386,7 +386,7 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
      *Runtime mechanism involves monitoring the budget usage, transitioning
      *and recovery from High critical stages.
      * */
-    handle_criticality(prev);
+    handle_criticality_change(prev);
 	/* If we need to preempt do so.
 	 * The following checks set resched to 1 in case of special
 	 * circumstances.
@@ -404,7 +404,7 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
         amc_defer_status = eACTIVE;
         if(amc->scheduled != sched_state_task_picked){
             next = sched_state_task_picked;
-            requeue(amc->scheduled);
+            requeue(amc->scheduled, amc);
         }
         else{
             next = amc->scheduled;
@@ -420,8 +420,8 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
         amc_defer_status = eINACTIVE;
         if(out_of_time){
             BUG_ON(!exists); /*Error scenario, out of time for non existent task.*/
-            if(amc_is_task_high_crit(amc->scheduled)){
-                TRACE_TASK("Budget overrun for task (%d)\n", amc->scheduled->pid);
+            if(is_task_high_crit(amc->scheduled)){
+                TRACE_TASK(amc->scheduled, "Budget overrun for task (%d)\n", amc->scheduled->pid);
                 if(handle_criticality_change(amc->scheduled)){
                     /*Task has enough budget to continue execution.*/
                     replenished = 1;
@@ -438,14 +438,14 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
             }
         }
         else if(sleep){
-            TRACE_TASK("Task (%d) signaled sleep.\n", amc->scheduled->pid);
+            TRACE_TASK(amc->scheduled, "Task (%d) signaled sleep.\n", amc->scheduled->pid);
             job_completion(amc->scheduled, !sleep);
             resched = 1;
         }
         else{
             /*Final condition: Handle the awkward long execution time observed
              * when the task is started using litmus wait mode.*/
-            reched = 1;
+            resched = 1;
         }
 	}
     else{
@@ -460,7 +460,7 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
             job_completion(amc->scheduled, !sleep);
         }
         resched = 1;
-        TRACE_TASK("Task (%d) observed a preemption scenario.\n", amc->scheduled->pid);
+        TRACE_TASK(amc->scheduled, "Task (%d) observed a preemption scenario.\n", amc->scheduled->pid);
     }
 
 /*****Scheduling Logic: End ***********************************************/
@@ -485,10 +485,10 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 		next = fp_prio_take(&amc->ready_queue);
         while(!amc_is_task_eligible(next) && next){
             add_low_crit_to_wait_queue(next);
-            next = fp_prio_take(&amc->read_queue);
+            next = fp_prio_take(&amc->ready_queue);
         }
 		if (next == prev)
-            TRACE_TASK("Picked previous task again to run: (%d)", next->pid);
+            TRACE_TASK(next, "Picked previous task again to run: (%d)", next->pid);
 		/* If preempt is set, we should not see the same task again. */
 		BUG_ON(preempt && next == prev);
 		/* Similarly, if preempt is set, then next may not be NULL,**/
@@ -682,9 +682,6 @@ static void amc_setup_domain_proc(void)
 
 static long amc_activate_plugin(void)
 {
-#if defined(CONFIG_RELEASE_MASTER) || defined(CONFIG_LITMUS_LOCKING)
-	int cpu;
-#endif
 	amc_setup_domain_proc();
 	return 0;
 }
@@ -713,8 +710,6 @@ static struct sched_plugin amc_plugin __cacheline_aligned_in_smp = {
 
 static int __init init_amc(void)
 {
-	int i;
-
 	/* We do not really want to support cpu hotplug, do we? ;)
 	 * However, if we are so crazy to do so,
 	 * we cannot use num_online_cpu()
