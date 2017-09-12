@@ -3,6 +3,15 @@
 
 #define MAX_CRITICALITY_LEVEL 5
 
+#define CONFIG_AMCDP
+
+#ifdef CONFIG_AMCDP
+typedef struct defer_prop{
+    unsigned int dp_value; /*dp slot value.*/
+    unsigned long abs_dp; /*Current dp offset.*/
+}defer_prop_t;
+#endif
+
 struct mc_task{
     unsigned int criticality;
 #ifdef CONFIG_MC_FP
@@ -16,9 +25,11 @@ struct mc_task{
     unsigned int task_index; /*Index assigned per ICG Protocol.*/
     unsigned int skip; /*Specifies if task is to be skipped or not.*/
 #endif
+
 #ifdef CONFIG_AMCDP
-    unsigned long dp;
+    defer_prop_t dp;
 #endif
+
 #ifdef CONFIG_AMCPT
     unsigned int pt;
 #endif

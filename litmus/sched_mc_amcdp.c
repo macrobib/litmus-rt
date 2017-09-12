@@ -9,6 +9,7 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/module.h>
+#include <linux/hrtimer.h>
 
 #include <litmus/litmus.h>
 #include <litmus/wait.h>
@@ -19,7 +20,7 @@
 #include <litmus/sched_trace.h>
 #include <litmus/trace.h>
 #include <litmus/budget.h>
-
+#include <litmus/mc_param.h>
 /* to set up domain/cpu mappings */
 #include <litmus/litmus_proc.h>
 #include <linux/uaccess.h>
@@ -41,7 +42,7 @@ typedef struct {
 typedef struct{
     long dp; /*active dp value.*/
     int armed;
-    struct hrtimer* timer;
+    struct hrtimer timer;
     struct task_struct* t;
 }defer_handler_t;
 defer_handler_t dp_handler;/*Active handler data.*/
@@ -70,23 +71,24 @@ static amc_domain_t amc_domain;
 static enum defer_status_t amc_defer_status = eINACTIVE;
 static struct task_struct* immediate_task_pick = NULL;
 static struct bheap amc_release_bin[MAX_CRITICALITY_LEVEL];
+
 /*******************Core MC Changes Start**************************/
 
 /*Comparison operator for defer point sorting.*/
 static int amc_dp_compare_expiry(struct bheap_node* a, struct bheap_node* b){
-    defer_prop_t* a_dp = container_of(a, defer_prop_t, dp_node);
-    defer_prop_t* b_dp = container_of(b, defer_prop_t, dp_node);
-    return (a_dp->dp) > (b_dp->dp); 
+    struct rt_param* a_dp = container_of(a, struct rt_param, heap_node );
+    struct rt_param* b_dp = container_of(b, struct rt_param, heap_node);
+    return (a_dp->task_params.mc_param.dp.dp_value) > (b_dp->task_params.mc_param.dp.dp_value); 
 }
 
 /*Deferment start timer handler.*/
 static enum hrtimer_restart amc_on_dp_timer_expiry(struct hrtimer* timer){
-    defer_prop_t* dptimer = container_of(timer, defer_prop_t, timer);
+    defer_handler_t* df_handler = container_of(timer, defer_handler_t, timer);
     unsigned long flags;
     local_irq_save(flags);
     amc_defer_status = ePENDING;
-    immediate_task_pick = dptimer->t;
-    litmus_local_reschedule();
+    immediate_task_pick = df_handler->t;
+    litmus_reschedule_local();
     local_irq_restore(flags);
     
     return HRTIMER_NORESTART;
@@ -97,7 +99,7 @@ static void amc_cancel_dp_timer(void){
     int ret;
     TRACE("AMC:DP - Cancelling defer timer.\n");
     if(dp_handler.armed){
-        ret = hrtimer_try_to_cancel(dp_handler.timer);
+        ret = hrtimer_try_to_cancel(&dp_handler.timer);
         BUG_ON(ret == 0);
         BUG_ON(ret == -1);
         dp_handler.armed = 0;
@@ -109,18 +111,20 @@ static int amc_start_dp_timer(struct task_struct* t, int restart){
     if(restart)
         amc_cancel_dp_timer();
 
-    long next_wake_time = litmus_clock() + tsk_rt(t)->defer_prop.dp;
-     __hrtimer_start_range_ms(&(dp_handler.timer), ns_to_ktime(next_wake_time),
+    long next_wake_time = litmus_clock() + tsk_rt(t)->task_params.mc_param.dp.dp_value;
+    tsk_rt(t)->task_params.mc_param.dp.abs_dp = next_wake_time;
+     __hrtimer_start_range_ns(&(dp_handler.timer), ns_to_ktime(next_wake_time),
                 0, HRTIMER_MODE_ABS_PINNED, 0);
+     dp_handler.t = t; 
      dp_handler.armed = 1;
-
 }
 
 /*Defer timer has completed pick new one.*/
-static int amc_pick_next_dp_timer(struct bheap* heap){
-    struct bheap_node* new_node = bheap_take(&deferred_preemption_heap);
-    struct task_struct* next_task = container_of(new_node, struct task_struct, heap_node);
-    amc_start_dp_next_timer(new_task, 0);
+static int amc_pick_next_dp_timer(void){
+    struct bheap_node* new_node = bheap_take(amc_dp_compare_expiry, &deferred_preemption_heap);
+    struct rt_param* next_param = container_of(new_node, struct rt_param, heap_node);
+    struct task_struct* t = container_of(next_param, struct task_struct, rt_param);
+    amc_start_dp_timer(t, 0);
 }
 
 /*Timer initalization for defer point tracking.*/
@@ -134,20 +138,19 @@ static void amc_init_dp_handler(void){
 /*Update the deferement queue, if a job is released with dp value less than
  * active timer, update the timer.*/
 static void amc_update_defer_points(struct task_struct* t){
-
-    long dp = tsk_rt(t)->task_params.mc_param.dp;
-    struct bheap_node* min_node = bheap_peek(deferred_preemption_heap);
-    struct defer_prop_t* active_dp = container_of(act_dp_task, defer_prop_t, dp_node);
-    if(!min_node){
+    long dp, active_dp;
+    dp = tsk_rt(t)->task_params.mc_param.dp.dp_value;
+    active_dp = dp_handler.dp;
+    if(!dp_handler.armed){
         /*No other defer timer active, start the current one.*/
-        amc_start_dp_timer(&(dp_handler.timer), 0);  
+        amc_start_dp_timer(t, 0);  
     }
-    else if(tsk_rt(t)->defer_prop.dp < active_dp->dp){
+    else if(dp < active_dp){
         /*An earlier defer point exists compared to active one, reset timer.*/
         amc_start_dp_timer(t, 1);
     }
     else{
-        bheap_insert(amc_dp_compare_expiry, deferred_preemption_heap, tsk_rt(t)->heap_node);
+        bheap_insert(amc_dp_compare_expiry, &deferred_preemption_heap, tsk_rt(t)->heap_node);
     }
 }
 
@@ -178,7 +181,7 @@ static void lower_system_criticality(void){
 }
 
 /*Is task eligible to run in current criticality.*/
-static int is_task_eligible(struct task_struct* t){
+static int amc_is_task_eligible(struct task_struct* t){
     int status = 0;
     if(tsk_rt(t)->task_params.mc_param.criticality >= current_criticality){
         status = 1;
@@ -195,11 +198,11 @@ static int amc_check_criticality(struct bheap_node* node){
 static void add_low_crit_to_wait_queue(struct task_struct* t){
     
     struct bheap* release_bin = &amc_release_bin[current_criticality - 1];
-    bheap_insert(fp_read_order, release_bin, tsk_rt(t)->heap_node);
+    bheap_insert(fp_ready_order, release_bin, tsk_rt(t)->heap_node);
 }
 
 /*Update task paramter for criticality change.*/
-int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
+int replenish_task_for_mode(struct task_struct* t, unsigned int action){
     int x1, x2 = 0;
     int status = 1;
     int budget_surplus;
@@ -230,10 +233,10 @@ int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
 }
 
 /*AMC: Update runqueue for current criticality similar to release queue.*/
-static void update_runqueue(){
+static void update_runqueue(void){
     
     bheap_iterate_clear(amc_check_criticality, fp_ready_order,
-            &amc_domain->domain->release_queue, &release_queue_bin);
+            &amc_domain.domain.release_queue, &release_queue_bin);
     TRACE_CUR("Update the runqueue for the current criticality.");
 }
 
@@ -242,9 +245,9 @@ static int handle_criticality_change(struct task_struct* scheduled){
     int status = 0;
     if(is_task_high_crit(scheduled)){/*change criticality only for high crit.*/
         if(raise_system_criticality()){
-            if(is_task_eligible(scheduled)){
+            if(amc_is_task_eligible(scheduled)){
                 status = 1;
-                replenish_task_for_mode(scheduled);
+                replenish_task_for_mode(scheduled, eRAISE_CRIT);
             }
             /*Notify user space of criticality change.
              *TODO: Does low crit task need to know?.
@@ -350,7 +353,6 @@ static void job_completion(struct task_struct* t, int forced)
 
     clear_release_heap(&local_amc->domain, &release_queue_bin, amc_check_criticality, fp_ready_order);
     TRACE_CUR("Updated the release queue for the current criticality.");
-
 }
 */
 

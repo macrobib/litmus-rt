@@ -523,7 +523,7 @@ static long icg_deactivate_plugin(void)
 
 /*	Plugin object	*/
 static struct sched_plugin icg_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "P-FP",
+	.plugin_name		= "ICG",
 	.task_new		= icg_task_new,
 	.complete_job		= complete_job,
 	.task_exit		= icg_task_exit,
