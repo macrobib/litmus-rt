@@ -157,8 +157,6 @@ static int get_aggregated_delta(int deadline){
  * */
 static int enough_slack_available(struct task_struct* t){
     int availability = 0;
-    struct bheap_node* head = bheap_peek(elastic_slack_order, )
-    int required_delta = ((t->mc_param).budget/(t->mc_param).deadline) * (t->mc_param).er_deadline;
     int available_delta = get_aggregated_delta(task_deadline);
     if(required_delta >= available_delta)
         availability = 1;
@@ -259,9 +257,14 @@ static void insert_slack_node(int deadline, int budget){
 /*If the selected task is low crit, check if enough slack available to run.
  * */
 static int elastic_is_task_eligible(struct task_struct* t){
+    int eligible = 1;
     if(!is_task_high_crit(t)){
-
+        if(enough_slack_available(t))
+            eligible = 1;
+        else
+            eligible = 0
     }
+    return eligible;
 }
 
 static int raise_system_criticality(void){
@@ -585,7 +588,7 @@ static struct task_struct* elastic_schedule(struct task_struct * prev){
         if(exists)
         if (exists && !blocks){
             /*Handle scheduled task for preemption.*/
-            if(is_task_eligible(elastic->scheduled)){
+            if(elastic_is_task_eligible(elastic->scheduled)){
                 /*If completed task is eligible, then requeue, else store.*/
 			        requeue(elastic->scheduled, edf);
                 }
@@ -593,8 +596,8 @@ static struct task_struct* elastic_schedule(struct task_struct * prev){
         /*Pick next ready task.*/
         prev = __take_ready(edf);
         /*If picked task is not eligible search till find one.*/
-        while(!is_task_eligible(prev) && (prev != NULL)){
-            add_low_crit_to_wait_queue(prev);
+        while(!elastic_is_task_eligible(prev) && (prev != NULL)){
+			requeue(elastic->scheduled, edf);
             prev = __take_ready(edf);
         }
         next = prev;

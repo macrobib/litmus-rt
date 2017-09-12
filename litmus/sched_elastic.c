@@ -105,7 +105,7 @@ static void elastic_domain_init(elastic_domain_t* elastic,
 /*********************Slack handler functions - Start*************************/
 
 /*Check if enough slack exists for an early release of new instance.*/
-static void enough_slack_available(struct task_struct* t){
+static int enough_slack_available(struct task_struct* t){
     int task_deadline = (t->mc_param).deadline;
     int delta = get_aggregated_delta(task_deadline);
     return delta >= task_deadline;
@@ -275,15 +275,6 @@ static void add_low_crit_to_wait_queue(struct task_struct* t){
     struct bheap* release_bin = &elastic_release_bin[current_criticality - 1];
     bheap_insert( edf_ready_order, release_bin, tsk_rt(t)->heap_node);
 }
-
-#ifdef MC_ENABLE_XEN
-static int raise_hypercall(void){
-    int status = 0;
-    status = HYPERVISOR_sched_op(SCHEDOP_criticality, NULL);
-    barrier();
-    return status;
-}
-#endif
 
 int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
     
