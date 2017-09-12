@@ -43,12 +43,7 @@ typedef struct zss_tracker{
     struct task_struct* t;
 }zss_tracker_t;
 
-/*AMC:
- * Store the tasks dropped from the release queue and runqueue respectively.
- *Tasks may be left in the undefined state during the criticality drop, to avoid
- *this tasks need to be allowed to continue back from where they left of, for that
- *need to save the tasks.
- * */
+static unsigned int zss_active_status = 0;
 bheap release_queue_bin;
 bheap runqueue_bin;
 zss_tracker_t zss_timer;
@@ -158,18 +153,8 @@ static void job_completion(struct task_struct* t, int forced)
 		sched_trace_task_release(t);
 }
 
-/*AMC: For the scheduling policy for which tasks are not
- * allowed to continue even if they were released before
- * criticality change, remove them from the release queue
- * to a temporary queue to be moved back when returning back
- * to prev criticality*/
-static void update_release_queue(){
-    clear_release_heap(&local_zss->domain, &release_queue_bin, zss_check_criticality, fp_ready_order);
-    TRACE_CUR("Updated the release queue for the current criticality.");
-}
-
 /*AMC: Update runqueue for current criticality similar to release queue.*/
-static void update_runqueue(){
+static void update_runqueue(void){
     bheap_iterate_clear(zss_check_criticality, fp_ready_order,
             &local_zss->domain->release_queue, &release_queue_bin);
     TRACE_CUR("Update the runqueue for the current criticality.");
@@ -177,11 +162,7 @@ static void update_runqueue(){
 
 static void handle_criticality(struct task_struct* prev){
     if(check_budget_overrun(prev)){
-        if(!raise_system_criticality()){
-            if(clear_rq_enabled())
-                update_release_queue();
-            update_runqueue(prev);
-        }
+        raise_system_criticality();
     }
     if(is_task_eligible(prev)){
         replenish_task_for_mode(prev);

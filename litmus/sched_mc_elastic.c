@@ -56,14 +56,14 @@ typedef struct slack{
     bheap_node* slack_node;    
 } slack_t;
 
-struct elastic_timer{
+struct active_slack_instance{
     struct hrtimer timer;
     struct task_struct* active_task;
     int armed;
 };
 
 /*Enforcement timer to maintain the slack expiration.*/
-struct elastic_timer slack_timer;
+struct active_slack_instance active_slack;
 static struct bheap slack_queue;
 int slack_state = 0; /*Slack state: Expired(0) or Active(1).*/
 int high_tasks_in_queue = 0; /*Keep count of high tasks in run queue.*/
@@ -105,39 +105,81 @@ static void elastic_domain_init(elastic_domain_t* elastic,
 }
 
 /*********************Slack handler functions - Start*************************/
-
-/*Next immediate release: Get the next immediate release of high crit task.*/
-static inline lt_t next_immediate_release(void){
+/*Support function for bheap traversal.*/
+static int elastic_slack_order(struct bheap_node* a, struct bheap_node* b){
+    struct slack* a_parent = container_of(a, struct slack, slack_node);
+    struct slack* b_parent = container_of(b, struct slack, slack_node);
+    return a_parent->deadline > b_parent->deadline;
 }
 
-/*Check if enough slack exists for an early release of new instance.*/
-static void enough_slack_available(struct task_struct* t){
+static void arm_slack_monitor(void, int restart){
+    struct bheap_node* slack_node = bheap_take(elastic_slack_order, &slack_queue);
+    struct slack_param* sp = container_of(slack_node, struct slack_param, slack_node);
+    if(sp && !active_slack.armed){
+        long slack_expiry = litmus_clock() + sp->period;
+        __hrtimer_start_range_ns(&active_slack.timer, ns_to_ktime(slack_expiry), 0, 
+            HRTIMER_MODE_ABS, 0);
+        slack_monitor_armed = 1;
+    }
+}
+
+/*A Hi crit task exceeded its budget, remove its slack contribution.*/
+static void remove_task_slack(struct task_struct* t){
+    active_slack.armed = 0;
+    struct slack_node* snode  = container_of(t, struct slack_node, t);
+    bheap_delete(elastic_slack_order, &slack_queue, snode->heap_node);
+}
+
+static inline int get_slack_budget(struct bheap_node* bnode){
+    struct slack* slack_instance = container_of(bnode, struct slack, slack_node);
+    return slack_instance->budget;
+}
+
+static inline int get_slack_deadline(struct bheap_node* bnode){
+    struct slack* slack_instance = container_of(bnode, struct slack, slack_node);
+    return slack_instance->deadline;
+}
+
+/*Get available slack till the given deadline.*/
+static int get_aggregated_delta(int deadline){
+   int iter_deadline = 0;
+   struct bheap_node* slack_iter = bheap_peek(elastic_slack_order, slack_queue);
+   int accumulated_slack = 0;
+   while(!slack_iter && deadline > iter_deadline){
+            accumulated_slack += get_slack_budget(slack_iter);
+            iter_deadline = get_slack_deadline(slack_iter);
+            slack_iter = bheap_next(slack_iter);
+   }
+   return accumulated_slack;
+}
+
+/*Check if enough slack exists for an early release of new instance.
+ * */
+static int enough_slack_available(struct task_struct* t){
+    int availability = 0;
+    struct bheap_node* head = bheap_peek(elastic_slack_order, )
     int required_delta = ((t->mc_param).budget/(t->mc_param).deadline) * (t->mc_param).er_deadline;
     int available_delta = get_aggregated_delta(task_deadline);
-    return required_delta >= available_delta;
+    if(required_delta >= available_delta)
+        availability = 1;
+    return availability;
 }
 
 /*Provide a scheduler specific handler to insert released job to ready queue.*/
 void elastic_release_job(struct _rt_domain *rt, struct bheap* tasks){
-    update_slack_queue(tasks);
     merge_ready(rt, tasks);
 }
 
 static enum hrtimer_restart on_slack_timeout(struct hrtimer* timer){
-    struct elastic_timer* et = container_of(timer, struct elastic_timer, timer);
     unsigned long flags;
-    struct task_struct* t;
-
+    struct 
     local_irq_save(flags);
-    t = et->parent_task;
     /*If the timer owner is active wait till the next early release point.*/
-    if(!is_task_running(t) && enough_slack_available(t)){
-        et->armed = 0;
-        task_immediate_pick = t;
-        litmus_local_reschedule();
-        local_irq_restore(flags);
-        return HRTIMER_NORESTART;
-    }
+    slack_monitor_armed = 0;
+    remove_task_slack(active);
+    arm_slack_monitor();
+    local_irq_restore(flag);
+    return HRTIMER_NORESTART;
 }
 
 /* Duplicated and extended to handle early release points while preparing for
@@ -184,9 +226,8 @@ void elastic_prepare_for_next_period(struct task_struct *t){
 /*Creates a slack timer for maintaining slack queues.*/
 static void elastic_init_timers(void){
 
-    slack_timer->timer;
-    hrtimer_init(&(slack_timer->timer), CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
-    (slack_timer->timer).function = on_slack_timeout;
+    hrtimer_init(&(active_slack.timer), CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+    (active_slack.timer).function = on_slack_timeout;
 }
 
 /*Calculate the default slack available in systems.
@@ -213,27 +254,16 @@ static void insert_slack_node(int deadline, int budget){
     bheap_insert(slack_comparator, slack_queue, new_node);
 }
 
-/* Update/Merge slack instances, remove expired slack instances.
- * Updation step: For an idle instance check the first element in
- * the release queue, insert a new slack task to queue. If the release
- * task is runnable in given slack, pick and schedule.
- * */
-static void update_slack_queue(bheap* tasks){
- 
-   struct bheap_node* node_iter = tasks->head;
-   lt_t delta = 0;
-   while(node_iter){
-       struct task_struct* t = contained_of(task_node, struct bheap_node,) ;
-       if(is_task_high_crit(t)){
-           high_tasks_in_queue += 1;
-           delta = HIGH_BUDGET(t) - LOW_BUDGET(t);
-           if(delta)
-               insert_slack_node(delta);
-       }
-   }
-}
 
 /*********************Slack handler functions - End* *************************/
+/*If the selected task is low crit, check if enough slack available to run.
+ * */
+static int elastic_is_task_eligible(struct task_struct* t){
+    if(!is_task_high_crit(t)){
+
+    }
+}
+
 static int raise_system_criticality(void){
     int status = 0;
 
@@ -481,7 +511,7 @@ static struct task_struct* elastic_schedule(struct task_struct * prev){
                         struct control_page* cp  = get_control_page(elastic->scheduled);
                         cp->active_crit = current_criticality;
                     }
-                    
+                    remove_task_slack(elastic->scheduled); /*Remove slack corresponding to given task.*/ 
                     if(replenish_task_for_mode(elastic->scheduled, eRAISE_CRIT)){
                         resched = 0;
                         exists = 1;
@@ -559,9 +589,6 @@ static struct task_struct* elastic_schedule(struct task_struct * prev){
                 /*If completed task is eligible, then requeue, else store.*/
 			        requeue(elastic->scheduled, edf);
                 }
-                else{
-                    add_low_crit_to_wait_queue(elastic->scheduled);
-                }
             }
         /*Pick next ready task.*/
         prev = __take_ready(edf);
@@ -586,15 +613,7 @@ static struct task_struct* elastic_schedule(struct task_struct * prev){
         /*Idle instance encoutered, force a low task to be run as 
          * background, or lower the criticality.*/
        // TRACE("becoming idle and lowering criticality at: %llu\n", litmus_clock());
-       // lower_system_criticality();
 	}
-   /** if(next){
-        printk(KERN_ERR"Budget Exiting..\n");
-        printk(KERN_ERR"Execution cost: %llu\n", get_exec_cost(next));
-        printk(KERN_ERR"Execution time: %llu\n", get_exec_time(next));
-        if(next == elastic->scheduled)
-            BUG_ON(budget_exhausted(next));
-    }**/
 	elastic->scheduled = next;
 	sched_state_task_picked();
 	raw_spin_unlock(&elastic->slock);
