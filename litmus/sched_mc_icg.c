@@ -56,22 +56,33 @@ static inline void icg_update_userspace(struct task_struct* t, int flag){
 }
 
 /*Check if task is marked for skipping or not.*/
-static inline unsigned int icg_is_task_eligible(struct task_struct* t){
+static inline int icg_is_task_eligible(struct task_struct* t){
     return (tsk_rt(t)->task_params.mc_param.skip == 0);
+}
+
+static inline unsigned int icg_active_masked_tasks(struct task_struct* t){
+    return (tsk_rt(t)->task_params.mc_param.mask_active == 1);
+}
+
+static inline void icg_update_active_mask(struct task_struct* t, unsigned int flag){
+    
+    tsk_rt(t)->task_params.mc_param.mask_active = flag;
 }
 
 /*Mark all the constrained tasks for given task with the new mask.
  *Returns total number of tasks marked.
  * */
-static int icg_mark_overridden_tasks(struct task_struct* t, int mask){
+static int icg_mark_overridden_tasks(struct task_struct* t, int flag){
     int count;
     int index;
+    struct task_struct* t;
     int mask = tsk_rt(t)->task_params.mc_param.mask;
     
     for(int i = 0; i < TOTAL_SKIP_COUNT; i++){
         if(mask & (1 << i)){
             count++;
-            constrained_indexed_tasks[i]->skip = mask;
+            t = constrained_indexed_tasks[i];
+            tsk_rt(t)->task_params.mc_param.skip = flag;
         }
     }
     if(count)
@@ -80,7 +91,7 @@ static int icg_mark_overridden_tasks(struct task_struct* t, int mask){
 }
 
 /*Replenish task for a mode change, return 1 if task has budget in new mode.*/
-static int icg_replenish_task_for_mode(struct task_struct* t, int mode){
+static int icg_replenish_task_for_mode(struct task_struct* t){
     int status = 1;
     int x1 = 0, x2 = 0;
     int budget_surplus = 0;
@@ -88,8 +99,7 @@ static int icg_replenish_task_for_mode(struct task_struct* t, int mode){
         x1 = tsk_rt(t)->task_params.mc_param.budget[1];
         x2 = tsk_rt(t)->task_params.mc_param.budget[0];
         budget_surplus = x1 - x2;
-        if(mode)
-            tsk_rt(t)->job_params.exec_time += budget_surplus;
+        tsk_rt(t)->job_params.exec_time -= budget_surplus;
     }
     if(!budget_remaining(t)){
         prepare_for_next_period(t);

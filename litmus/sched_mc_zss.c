@@ -40,13 +40,7 @@ typedef struct zss_tracker{
     int armed;
     lt_t zss_time;
     struct hrtimer timer;
-    struct task_struct* t;
 }zss_tracker_t;
-
-typedef struct zss_instance{
-    lt_t activation;
-    struct task_struct* t;
-}
 
 enum timer_action{
     eSTART,
@@ -56,6 +50,7 @@ enum timer_action{
 /*System modes in zero slack approach.*/
 enum system_mode{
     eNORMAL,
+    eCRITICAL_PENDING,
     eCRITICAL,
 };
 
@@ -64,32 +59,18 @@ bheap runqueue_bin;
 zss_tracker_t zss_timer;/*Timer instance.*/
 struct task_struct* task_immediate_schedule; /*Marks the  current active zero slack instance.*/
 zss_domain_t zss_domain; /*Scheduler abstraction.*/
+
 bheap zss_instances; /*Saves the active zero slack instances in increasing order of expiry*/
 
 #define ZSS_ACTIVATION_TIME(t) (((tsk_rt(t))->mc_param).zss_time)
 /*Runs timer for next expiring zero slack instance.*/
-static void start_next_timer(void){
 
-}
-
-/** ZSS timeout handler. **/
-static enum hrtimer_restart on_zss_timeout(struct hrtimer* timer){
-
-     unsigned long flags;
-     local_irq_save(flags);
-     zss_tracker_t* tracker = container_of(timer, zss_tracker_t, timer);
-     raise_system_criticality();
-     task_immediate_schedule = tracker->t;
-     litmus_reschedule_local(); 
-     local_irq_restore(flags);
-     return HRTIMER_NORESTART;
-}
-
-static void zss_stop_timer(struct task_struct* t){
-    if(t != zss_timer.t)
-        TRACE("zss timer stoped by task differing from startin task.\n");
-    if(!hrtimer_try_to_cancel(zss_timer.timer))
-        TRACE("tried to cancel inactive zss timer.\n");
+static int zero_slack_comparator(struct bheap_node* a, struct bheap_node* b){
+    struct task_struct* at = bheap2task(a);
+    struct task_struct* bt = bheap2task(b);
+    lt_t a_zsi = tsk_rt(at)->job_params.release + tsk_rt(at)->task_params.mc_param.zsi;
+    lt_t b_zsi = tsk_rt(bt)->job_params.release + tsk_rt(bt)->task_params.mc_param.zsi;
+    return a_zsi > b_zsi;
 }
 
 static int zss_start_timer(struct task_struct* t, enum timer_action action){
@@ -114,6 +95,55 @@ static int zss_start_timer(struct task_struct* t, enum timer_action action){
         BUG_ON("Invalid timer action.\n");
     }
 }
+
+inline static insert_zero_slack_instance(struct task_struct* t){
+    lt_t t_zsi;
+    t_zsi = tsk_rt(t)->job_params.release + tsk_rt(t)->task_params.mc_param.zsi;
+    if(t_zsi < zss_timer.zss_time){
+        zss_start_timer(t, eRESTART);
+    }
+    else{
+        bheap_insert(zero_slack_comparator, &zss_instances, tsk_rt(t)->heap_node);
+    }
+}
+
+inline static remove_zero_slack_instance(struct task_struct* t){
+    bheap_delete(zero_slack_comparator, &zss_instances, tsk_rt(t)->heap_node);
+    struct bheap_node* node = bheap_peek(zero_slack_comparator, &zss_instances);
+    if(node){
+        struct task_struct* next_t = bheap2task(node);
+        zss_start_timer(next_t, eRESTART);
+    }
+}
+
+/** ZSS timeout handler. **/
+static enum hrtimer_restart on_zss_timeout(struct hrtimer* timer){
+
+     unsigned long flags;
+     local_irq_save(flags);
+     zss_tracker_t* tracker = container_of(timer, zss_tracker_t, timer);
+     raise_system_criticality();
+     task_immediate_schedule = tracker->t;
+     litmus_reschedule_local(); 
+     local_irq_restore(flags);
+     return HRTIMER_NORESTART;
+}
+
+static void zss_stop_timer(struct task_struct* t){
+    if(t != zss_timer.t)
+        TRACE("zss timer stoped by task differing from startin task.\n");
+    if(!hrtimer_try_to_cancel(zss_timer.timer))
+        TRACE("tried to cancel inactive zss timer.\n");
+}
+
+static int update_timer_if_req(struct task_struct* t){
+    
+    lt_t t_zsi = tsk_rt(t)->job_params.release + tsk_rt(at)->task_params.mc_param.zsi;
+    if(t_zsi < zss_timer.zss_time){
+        zss_start_timer(t, eRESTART);
+    }
+}
+
 
 /* we assume the lock is being held */
 static void preempt(zss_domain_t *zss)
@@ -202,7 +232,12 @@ static void job_completion(struct task_struct* t, int forced)
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
 
 	tsk_rt(t)->completed = 0;
-	prepare_for_next_period(t);
+	if(system_mode == eNORMAL){
+        if(is_task_high_crit(t)){
+            remove_zero_slack_instance(t);
+        }
+    }
+    prepare_for_next_period(t);
 	if (is_released(t, litmus_clock()))
 		sched_trace_task_release(t);
 }
@@ -271,11 +306,12 @@ static struct task_struct* zss_schedule(struct task_struct * prev)
 	sleep	    = exists && is_completed(zss->scheduled);
 	preempt     = !blocks && (fp_preemption_needed(&zss->ready_queue, prev));
 
-    if(system_mode == ePENDING){
+    if(system_mode == eCRITICAL_PENDING){
         /*Drop low critical tasks.*/
         prepare_for_next_period(zss->scheduled);
         next = sched_state_task_picked;
         system_mode == eCRITICAL;
+        current_criticality = 1; /*To reuse the common macro to check schedulability.*/
         zss_update_userspace(next);
         goto completed;
     }
@@ -369,6 +405,11 @@ static struct task_struct* zss_schedule(struct task_struct * prev)
         }
         
         zss->scheduled = next;
+        if(system_mode == eNORMAL){
+           if(is_task_high_crit(next)){
+                insert_zero_slack_instance(next);
+           } 
+        }
         sched_state_task_picked();
         raw_spin_unlock(&zss->slock);
     }

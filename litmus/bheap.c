@@ -389,7 +389,3 @@ struct bheap_node* bheap_cond_next(bheap_prio_t iterate_cond, struct bheap_node*
     return ret;
 }
 
-inline struct bheap_node* bheap_next(struct bheap_node* heap_node){
-    return (!heap_node) ? NULL : (heap_node->next);
-}
-
