@@ -601,7 +601,7 @@ static long zss_deactivate_plugin(void)
 
 /*	Plugin object	*/
 static struct sched_plugin zss_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "AMC-ZSS",
+	.plugin_name		= "ZSS",
 	.task_new		= zss_task_new,
 	.complete_job		= complete_job,
 	.task_exit		= zss_task_exit,

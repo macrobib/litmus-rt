@@ -1,5 +1,6 @@
 #ifndef _LITMUS_MC_PARAM_H
 #define _LITMUS_MC_PARAM_H
+#include <litmus/bheap.h>
 
 #define MAX_CRITICALITY_LEVEL 5
 
@@ -7,6 +8,7 @@
 #define CONFIG_ELASTIC
 #define CONFIG_ZSS
 #define CONFIG_ICG
+#define CONFIG_SERV_ADAPTATION
 
 #ifdef CONFIG_AMCDP
 typedef struct defer_prop{
@@ -47,12 +49,16 @@ struct mc_task{
     struct slack ts;
 #endif
 
-#define CONFIG_ZSS
-    lt_t zsi;
+#ifdef CONFIG_ZSS
+    long zsi;
 #endif
 
 #ifdef CONFIG_AMCPT
     unsigned int pt;
+#endif
+
+#ifdef CONFIG_SERV_ADAPTATION
+    unsigned int recovery_period;
 #endif
 
 };

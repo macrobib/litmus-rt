@@ -73,12 +73,7 @@ void bheap_node_free(struct bheap_node* hn);
 int bheap_add(bheap_prio_t higher_prio, struct bheap* heap,
 	     void* value, int gfp_flags);
 
-inline struct bheap_node* bheap_next(struct bheap_node* heap_node){
-                 
-        return (!heap_node) ? NULL : (heap_node->next);                             
-
-}
-
+extern struct bheap_node* bheap_next(struct bheap_node* heap_node);
 extern void* bheap_take_del(bheap_prio_t higher_prio,
 		    struct bheap* heap);
 extern void bheap_iterate_delete(bheap_prio_t higher_prio,struct bheap* heap);

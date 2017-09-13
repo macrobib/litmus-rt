@@ -41,7 +41,7 @@ typedef struct {
 typedef struct{
     long dp; /*active dp value.*/
     int armed;
-    struct hrtimer* timer;
+    struct hrtimer timer;
     struct task_struct* t;
 }defer_handler_t;
 defer_handler_t dp_handler;/*Active handler data.*/

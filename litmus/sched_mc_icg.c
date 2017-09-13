@@ -60,18 +60,19 @@ static inline int icg_is_task_eligible(struct task_struct* t){
     return (tsk_rt(t)->task_params.mc_param.skip == 0);
 }
 
-static inline unsigned int icg_active_masked_tasks(struct task_struct* t){
+/* Verify if given task initiated an active interference.*/
+static inline unsigned int icg_active_interfer(struct task_struct* t){
     return (tsk_rt(t)->task_params.mc_param.mask_active == 1);
 }
 
-static inline void icg_update_active_mask(struct task_struct* t, unsigned int flag){
+/*Start an active interference for given task.*/
+static inline void icg_update_task_interfer(struct task_struct* t, unsigned int flag){
     
     tsk_rt(t)->task_params.mc_param.mask_active = flag;
 }
 
 /*Mark all the constrained tasks for given task with the new mask.
- *Returns total number of tasks marked.
- * */
+ *Returns total number of tasks marked. **/
 static int icg_mark_overridden_tasks(struct task_struct* t, int flag){
     int count;
     int index;
@@ -102,7 +103,6 @@ static int icg_replenish_task_for_mode(struct task_struct* t){
         tsk_rt(t)->job_params.exec_time -= budget_surplus;
     }
     if(!budget_remaining(t)){
-        prepare_for_next_period(t);
         status = 0;
     }
     return status;
@@ -144,7 +144,7 @@ static void icg_release_jobs(rt_domain_t* rt, struct bheap* tasks)
 	    }
         else{
             prepare_for_next_period(t);
-            requeue(t);;
+            requeue(t);
         }
 	}
 	/* do we need to preempt? */
@@ -183,7 +183,10 @@ static void job_completion(struct task_struct* t, int forced)
 	sched_trace_task_completion(t, forced);
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
     /*Task has completed reenable the masked tasks if any.*/
-    icg_mark_overridden_tasks(t, 0);
+    if(icg_active_interfer(t)){
+        icg_mark_overridden_tasks(t, 0);
+        icg_update_task_interfer(0);
+    }
 	tsk_rt(t)->completed = 0;
 	prepare_for_next_period(t);
 	if (is_released(t, litmus_clock()))
@@ -202,7 +205,7 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 	icg_domain_t* 	icg = &icg_domain;
 	struct task_struct*	next;
     struct task_struct* scheduled = icg->scheduled;
-	int out_of_time, sleep, preempt, np, exists, blocks, resched;
+	int out_of_time, sleep, preempt, np, exists, blocks, resched, mark_complete;
 
 	raw_spin_lock(&icg->slock);
 
@@ -214,6 +217,7 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 	BUG_ON(icg->scheduled && !is_realtime(prev));
 
 	/* (0) Determine state */
+    mark_complete = 1;
 	exists      = icg->scheduled != NULL;
 	blocks      = exists && !is_current_running();
 	out_of_time = exists && budget_enforced(icg->scheduled)
@@ -233,11 +237,12 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
          * if not preempt. Else check for tasks to override.
          * */
         if(scheduled->mc_param->override_list){
+            icg_update_task_interfer(scheduled);
             icg_mark_overridden_tasks(scheduled, 1);
-            if(icg_replenish_task_for_mode(edfvd->scheduled)){
+            if(!icg_replenish_task_for_mode(edfvd->scheduled)){
                 /*Task has no budget left in high criticality mode as well.
                  * Pick next task.*/
-                resched = 1;
+                mark_complete = 1;
                 TRACE_TASK("Budget overrun for task in high mode: (%d)\n", scheduled->pid);
             }
             else{
@@ -245,12 +250,13 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
                 reched = 0;
             }
         }
+        else{
+            resched = 1; /*No tasks to override, remove the task and pick next.*/
+        }
     }
     else if(sleep){
         /*Once task has completed execution, uncheck any marked tasks.*/
-        job_completion(scheduled, !sleep);
-        icg_mark_overridden_tasks(scheduled, 0);
-        resched = 1;
+        mark_complete = 1;
     }
     else{
         /*Unlikely state from a blocked task.: possible preemption.*/
@@ -263,18 +269,15 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 	if (blocks)
 		resched = 1;
 
-	/* Request a sys_exit_np() call if we would like to preempt but cannot.
-	 * Multiple calls to request_exit_np() don't hurt.
-	 */
-	if (np && (out_of_time || preempt || sleep))
-		request_exit_np(icg->scheduled);
-
 	/* Any task that is preemptable and either exhausts its execution
 	 * budget or wants to sleep completes. We may have to reschedule after
 	 * this.
 	 */
-	if (!np && (out_of_time || sleep)) {
-		job_completion(icg->scheduled, !sleep);
+	if (!np && mark_complete) {
+        mark_complete = 0;
+        job_completion(scheduled, !sleep);
+        icg_mark_overridden_tasks(scheduled, 0);
+        icg_update_task_interfer(0);
 		resched = 1;
 	}
 
@@ -292,6 +295,10 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 		if (icg->scheduled && !blocks)
 			requeue(icg->scheduled, icg);
 		next = fp_prio_take(&icg->ready_queue);
+        while(!icg_is_task_eligible(next) && next){
+            prepare_for_next_period(next);
+            next = fp_prio_take(&icg->ready_queue);
+        }
 		if (next == prev) {
 			struct task_struct *t = fp_prio_peek(&icg->ready_queue);
 			TRACE_TASK(next, "next==prev sleep=%d oot=%d np=%d preempt=%d "

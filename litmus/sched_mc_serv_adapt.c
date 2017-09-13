@@ -9,6 +9,7 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/module.h>
+#include <linux/hrtimer.h>
 
 #include <litmus/litmus.h>
 #include <litmus/jobs.h>
@@ -20,14 +21,9 @@
 #include <litmus/trace.h>
 
 /* to set up domain/cpu mappings */
+#include <litmus/mc_param.h>
 #include <litmus/litmus_proc.h>
 #include <linux/module.h>
-/*EDFVD: added for hypercall invocation.*/
-#ifdef ENABLE_MC_XEN
-#include <asm/xen/interface.h>
-#include <asm/xen/hypercall.h>
-#include <xen/hvc-console.h>
-#endif
 
 typedef struct {
 	rt_domain_t 		domain;
@@ -47,7 +43,8 @@ typedef enum{
 /*EDFVD Domain variable.*/
 sa_domain_t local_domain;
 
-/*EDFVD: storage for the tasks removed from criticality change.*/
+struct hrtimer recovery_timer;
+
 static struct bheap sa_release_bin[MAX_CRITICALITY_LEVEL];
 
 static void sa_domain_init(sa_domain_t* sa,
@@ -58,6 +55,20 @@ static void sa_domain_init(sa_domain_t* sa,
 	edf_domain_init(&sa->domain, check, release);
 	sa->cpu      		= cpu;
 	sa->scheduled		= NULL;
+}
+
+static void sa_arm_recovery_timer(void){
+    long wakeup_time = litmus_clock() + ms2ns(recovery_time);
+    __hrtimer_start_range_ms(&(recovery_timer), ns_to_ktime(wakeup_time), 0,
+            HRTIMER_MODE_ABS_PINNED, 0);
+}
+
+static void sa_cancel_recovery_timer(void){
+    int ret;
+    TRACE("SA: Cancelling the recovery timer.\n");
+    ret = hrtimer_try_to_cancel(&recovery_timer);
+    BUG_ON(ret == 0);
+    BUG_ON(ret == -1);
 }
 
 static int raise_system_criticality(void){
@@ -113,15 +124,6 @@ static hrtimer_restart on_sa_recovery_timer(struct hrtimer* timer){
     return HRTIMER_NORESTART;
 }
 
-
-#ifdef MC_ENABLE_XEN
-static int raise_hypercall(void){
-    int status = 0;
-    status = HYPERVISOR_sched_op(SCHEDOP_criticality, NULL);
-    barrier();
-    return status;
-}
-#endif
 
 int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
     
@@ -335,6 +337,7 @@ static struct task_struct* sa_schedule(struct task_struct * prev)
                           * long and wakes with large time delta.*/
                          resched = 1;
                     }
+                    /*Start recovery timer.*/
                 }
                 else{
                     /*System criticality ceiling reached, mark and reschedule.*/
@@ -404,14 +407,14 @@ static struct task_struct* sa_schedule(struct task_struct * prev)
 			        requeue(sa->scheduled, edf);
                 }
                 else{
-                    add_low_crit_to_wait_queue(sa->scheduled);
+                    prepare_for_next_period(sa->scheduled);
                 }
             }
         /*Pick next ready task.*/
         prev = __take_ready(edf);
         /*If picked task is not eligible search till find one.*/
         while(!is_task_eligible(prev) && (prev != NULL)){
-            add_low_crit_to_wait_queue(prev);
+            prepare_for_next_period(prev);
             prev = __take_ready(edf);
         }
         next = prev;
@@ -876,6 +879,8 @@ static int __init init_sa(void)
         current_criticality = 0; /*Reinitializing for plugin switches.*/
 		sa_domain_init(&local_domain,
 				   sa_check_resched,NULL, 0);
+    hrtimer_init(&recovery_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+    recovery_timer.function = on_sa_recovery_timer;
 	return register_sched_plugin(&psn_edf_plugin);
 }
 
