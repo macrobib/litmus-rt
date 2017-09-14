@@ -9,8 +9,9 @@
 #define CONFIG_ZSS
 #define CONFIG_ICG
 #define CONFIG_SERV_ADAPTATION
-
+#define CONFIG_AMCPT
 #ifdef CONFIG_AMCDP
+
 typedef struct defer_prop{
     unsigned int dp_value; /*dp slot value.*/
     unsigned long abs_dp; /*Current dp offset.*/
@@ -28,9 +29,7 @@ typedef struct slack{
 
 struct mc_task{
     unsigned int criticality;
-#ifdef CONFIG_MC_FP
     unsigned int prio;
-#endif
     unsigned long period[MAX_CRITICALITY_LEVEL];
     unsigned long budget[MAX_CRITICALITY_LEVEL];
     unsigned long deadline[MAX_CRITICALITY_LEVEL];

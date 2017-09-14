@@ -49,13 +49,13 @@ typedef enum{
  *this tasks need to be allowed to continue back from where they left of, for that
  *need to save the tasks.
  * */
-struct bheap release_queue_bin;
-struct bheap runqueue_bin;
+static struct bheap release_queue_bin;
+static struct bheap runqueue_bin;
 
 DEFINE_PER_CPU(amc_domain_t, amc_domains);
 
 /*Single domain variable as single core considered.*/
-amc_domain_t amc_domain;
+static amc_domain_t amc_domain;
 
 /*******************Core MC Changes Start**************************/
 static struct bheap amc_release_bin[MAX_CRITICALITY_LEVEL];

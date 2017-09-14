@@ -126,7 +126,7 @@ static enum hrtimer_restart on_sa_recovery_timer(struct hrtimer* timer){
 }
 
 
-int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
+static int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
     
     int x1 = 0, x2 = 0;
     int status = 1;

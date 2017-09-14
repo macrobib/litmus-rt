@@ -48,20 +48,20 @@ typedef enum{
  *this tasks need to be allowed to continue back from where they left of, for that
  *need to save the tasks.
  * */
-bheap release_queue_bin;
-bheap runqueue_bin;
+struct bheap release_queue_bin;
+struct bheap runqueue_bin;
 
 /*Boost and lower priority to and from preemption threshold value.*/
-#define BOOST_PRIO_TO_PT(t) (tsk_rt(t)->task_params.priority = tsk_rt(t)->task_params.mc_params.pt) 
-#define RESET_PRIO(t) (tsk_rt(t)->task_params.priority = tsk_rt(t)->task_params.mc_params.prio)
+#define BOOST_PRIO_TO_PT(t) (tsk_rt(t)->task_params.priority = tsk_rt(t)->task_params.mc_param.pt) 
+#define RESET_PRIO(t) (tsk_rt(t)->task_params.priority = tsk_rt(t)->task_params.mc_param.prio)
 
 /*Single domain variable as single core considered.*/
-amc_domain_t amc_domain;
+static amc_domain_t amc_domain;
 
 /*******************Core MC Changes Start**************************/
 static struct bheap amc_release_bin[MAX_CRITICALITY_LEVEL];
 
-static int amc_is_task_elgible(struct task_struct* t){
+static int amc_is_task_eligible(struct task_struct* t){
     int status = 0;
     if(tsk_rt(t)->task_params.mc_param.criticality >= current_criticality){
         status = 1;
@@ -85,7 +85,7 @@ static void lower_system_criticality(void){
     rt_domain_t* amc = &(amc_domain.domain);
     if (current_criticality > 0){
         current_criticality -= 1;
-        release_bin = &edfvd_release_bin[current_criticality];
+        release_bin = &amc_release_bin[current_criticality];
         update_release_heap(amc, release_bin, fp_ready_order, 1);
     }
     else{
@@ -95,13 +95,13 @@ static void lower_system_criticality(void){
 
 static int amc_check_criticality(struct bheap_node* node){
     struct task_struct* task = bheap2task(node);
-    return (is_task_elgible(task));
+    return (is_task_eligible(task));
 }
 
 /*Add low crit task to wait queue.*/
 static void add_low_crit_to_wait_queue(struct task_struct* t){
     struct bheap* release_bin = &amc_release_bin[current_criticality - 1];
-    bheap_insert(fp_read_order, release_bin, tsk_rt(t)->heap_node);
+    bheap_insert(fp_ready_order, release_bin, tsk_rt(t)->heap_node);
 }
 
 /*Update task paramter for criticality change.*/
@@ -129,17 +129,17 @@ int replenish_task_for_mode(struct task_struct* t, crit_action_t action){
             }
         }
         else{
-            TRACE_TASK("Undefined replenishment called for (%d)\n", t->pid);
+            TRACE_TASK(t, "Undefined replenishment called.");
         }
     }
     return status;
 }
 
 /*AMC: Update runqueue for current criticality similar to release queue.*/
-static void update_runqueue(){
+static void update_runqueue(void){
     
     bheap_iterate_clear(amc_check_criticality, fp_ready_order,
-            &amc_domain->domain->release_queue, &release_queue_bin);
+            &amc_domain.domain.release_queue, &release_queue_bin);
     TRACE_CUR("Update the runqueue for the current criticality.");
 }
 
@@ -147,13 +147,11 @@ static void handle_criticality(struct task_struct* prev){
     
     if(check_budget_overrun(prev)){
         if(!raise_system_criticality()){
-            if(clear_rq_enabled())
-                update_release_queue();
-            update_runqueue(prev);
+            update_runqueue();
         }
     }
     if(is_task_eligible(prev)){
-        replenish_task_for_mode(prev);
+        replenish_task_for_mode(prev, eRAISE_CRIT);
     }
 }
 /*******************Core MC Changes END ***************************/
@@ -273,7 +271,6 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 	                     && budget_exhausted(amc->scheduled);
 	np 	    = exists && is_np(amc->scheduled);
 	sleep	    = exists && is_completed(amc->scheduled);
-	migrate     = exists && get_partition(amc->scheduled) != amc->cpu;
 	preempt     = !blocks && (fp_preemption_needed(&amc->ready_queue, prev));
     
     if(exists && !budget_precisely_enforced(amc->scheduled))
@@ -301,9 +298,8 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
     if (!np && (out_of_time || sleep)) {
         if(out_of_time){
             BUG_ON(!exists); /*Error scenario, out of time for non existent task.*/
-            if(amc_is_task_high_crit(amc->scheduled)){
-                TRACE_TASK("Budget overrun for task (%d)\n", amc->scheduled->pid);
-                if(replenish_task_for_mode(amc->scheduled)){
+            if(is_task_high_crit(amc->scheduled)){
+                if(replenish_task_for_mode(amc->scheduled, eRAISE_CRIT)){
                     /*Task has enough budget to continue execution.*/
                     replenished = 1;
                 }
@@ -319,14 +315,13 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
             }
         }
         else if(sleep){
-            TRACE_TASK("Task (%d) signaled sleep.\n", amc->scheduled->pid);
             job_completion(amc->scheduled, !sleep);
             resched = 1;
         }
         else{
             /*Final condition: Handle the awkward long execution time observed
              * when the task is started using litmus wait mode.*/
-            reched = 1;
+            resched = 1;
         }
 	}
     else{
@@ -340,7 +335,6 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
             job_completion(amc->scheduled, !sleep);
         }
         resched = 1;
-        TRACE_TASK("Task (%d) observed a preemption scenario.\n", amc->scheduled->pid);
     }
 
 	/* The final scheduling decision. Do we need to switch for some reason?
@@ -363,9 +357,9 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 		next = fp_prio_take(&amc->ready_queue);
 		if (next == prev) {
 			struct task_struct *t = fp_prio_peek(&amc->ready_queue);
-			TRACE_TASK(next, "next==prev sleep=%d oot=%d np=%d preempt=%d migrate=%d "
+			TRACE_TASK(next, "next==prev sleep=%d oot=%d np=%d preempt=%d "
 				   "boost=%d empty=%d prio-idx=%u prio=%u\n",
-				   sleep, out_of_time, np, preempt, migrate,
+				   sleep, out_of_time, np, preempt,
 				   is_priority_boosted(next),
 				   t == NULL,
 				   priority_index(next),
@@ -380,7 +374,7 @@ static struct task_struct* amc_schedule(struct task_struct * prev)
 		BUG_ON(preempt && next == prev);
 		/* Similarly, if preempt is set, then next may not be NULL,
 		 * unless it's a migration. */
-		BUG_ON(preempt && !migrate && next == NULL);
+		BUG_ON(preempt && next == NULL);
 	} else
 		/* Only override Linux scheduler if we have a real-time task
 		 * scheduled that needs to continue.
@@ -504,7 +498,7 @@ static void amc_task_exit(struct task_struct * t)
 	if (is_queued(t)) {
 		BUG(); /* This currently doesn't work. */
 		/* dequeue */
-		dom  = &amc_domain;
+		dom  = &amc_domain.domain;
 		remove(dom, t);
 	}
 	if (amc->scheduled == t) {
