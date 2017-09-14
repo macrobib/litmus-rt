@@ -44,7 +44,7 @@ typedef enum{
     eRAISE_CRIT
 }crit_action_t;
 /*EDFVD Domain variable.*/
-edfvd_domain_t local_domain;
+static edfvd_domain_t local_domain;
 
 /*EDFVD: storage for the tasks removed from criticality change.*/
 static struct bheap edfvd_release_bin[MAX_CRITICALITY_LEVEL];

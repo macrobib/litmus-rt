@@ -43,6 +43,8 @@ typedef enum{
 /*EDFVD Domain variable.*/
 sa_domain_t local_domain;
 
+int recovery_time;
+
 struct hrtimer recovery_timer;
 
 static struct bheap sa_release_bin[MAX_CRITICALITY_LEVEL];
@@ -58,8 +60,8 @@ static void sa_domain_init(sa_domain_t* sa,
 }
 
 static void sa_arm_recovery_timer(void){
-    long wakeup_time = litmus_clock() + ms2ns(recovery_time);
-    __hrtimer_start_range_ms(&(recovery_timer), ns_to_ktime(wakeup_time), 0,
+    long wakeup_time = litmus_clock() + recovery_time;
+    __hrtimer_start_range_ns(&(recovery_timer), ns_to_ktime(wakeup_time), 0,
             HRTIMER_MODE_ABS_PINNED, 0);
 }
 
@@ -100,7 +102,6 @@ static void lower_system_criticality(void){
 }
 
 static int sa_check_criticality(struct bheap_node* node){
-
     struct task_struct* task = bheap2task(node);
     return (is_task_eligible(task));
 }
@@ -115,7 +116,7 @@ static void add_low_crit_to_wait_queue(struct task_struct* t){
 /*Recovery timer to revert back to lower criticality, do not invoke 
  * immediate scheduling to allow active task to finish its execution if active.
  * */
-static hrtimer_restart on_sa_recovery_timer(struct hrtimer* timer){
+static enum hrtimer_restart on_sa_recovery_timer(struct hrtimer* timer){
     unsigned long flags;
     local_irq_save(flags);
     TRACE("Recovery timer invoked..\n");

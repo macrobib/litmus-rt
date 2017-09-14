@@ -202,7 +202,7 @@ static void add_low_crit_to_wait_queue(struct task_struct* t){
 }
 
 /*Update task paramter for criticality change.*/
-int replenish_task_for_mode(struct task_struct* t, unsigned int action){
+static int replenish_task_for_mode(struct task_struct* t, unsigned int action){
     int x1, x2 = 0;
     int status = 1;
     int budget_surplus;

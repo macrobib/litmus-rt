@@ -24,9 +24,15 @@
 #include <litmus/litmus_proc.h>
 #include <linux/uaccess.h>
 
+/* Core criticality actions. */                                                 
+enum crit_action_t{                                                             
+  eLOWER_CRIT,                                                                
+  eRAISE_CRIT                                                                 
+};
 
 typedef struct {
-	rt_domain_t 		domain;
+    int cpu;
+    rt_domain_t 		domain;
 	struct fp_prio_queue	ready_queue;
 	struct task_struct* 	scheduled; /* only RT tasks */
 /*
@@ -39,6 +45,7 @@ typedef struct {
 typedef struct zss_tracker{
     int armed;
     lt_t zss_time;
+    struct task_struct* t;
     struct hrtimer timer;
 }zss_tracker_t;
 
@@ -54,15 +61,19 @@ enum system_mode{
     eCRITICAL,
 };
 
-/*In critical mode, move park low crit tasks to runqueue bin.*/
-bheap runqueue_bin;
+int system_mode = eNORMAL;
+
+struct bheap release_bin;
+
 zss_tracker_t zss_timer;/*Timer instance.*/
+
 struct task_struct* task_immediate_schedule; /*Marks the  current active zero slack instance.*/
+
 zss_domain_t zss_domain; /*Scheduler abstraction.*/
 
-bheap zss_instances; /*Saves the active zero slack instances in increasing order of expiry*/
+struct bheap zss_instances; /*Saves the active zero slack instances in increasing order of expiry*/
 
-#define ZSS_ACTIVATION_TIME(t) (((tsk_rt(t))->mc_param).zss_time)
+#define ZSS_ACTIVATION_TIME(t) (((tsk_rt(t))->task_params.mc_param).zsi)
 /*Runs timer for next expiring zero slack instance.*/
 
 static int zero_slack_comparator(struct bheap_node* a, struct bheap_node* b){
@@ -73,7 +84,28 @@ static int zero_slack_comparator(struct bheap_node* a, struct bheap_node* b){
     return a_zsi > b_zsi;
 }
 
-static int zss_start_timer(struct task_struct* t, enum timer_action action){
+static inline void reduce_system_criticality(void){
+   if(!current_criticality)
+       BUG_ON(current_criticality);
+   else
+       current_criticality -= 1; 
+}
+
+static inline int raise_system_criticality(void){
+    int status = 1;
+    if(!current_criticality)
+        current_criticality += 1;
+    else
+        status = 0;
+    return status;
+}
+
+  /*Add low crit task to wait queue.*/                                            
+  static void add_low_crit_to_wait_queue(struct task_struct* t){
+     bheap_insert(fp_ready_order, &release_bin, tsk_rt(t)->heap_node);            
+  } 
+
+static void zss_start_timer(struct task_struct* t, enum timer_action action){
     lt_t zss_timer_start;
     if(action == eSTART){
         if(zss_timer.armed)
@@ -82,6 +114,7 @@ static int zss_start_timer(struct task_struct* t, enum timer_action action){
         __hrtimer_start_range_ns(&(zss_timer.timer), ns_to_ktime(zss_timer_start),
                 0, HRTIMER_MODE_ABS_PINNED, 0);
         zss_timer.armed = 1;
+        zss_timer.t = t;
     }
     else if(action == eRESTART){
         /*Offset update.*/
@@ -90,13 +123,14 @@ static int zss_start_timer(struct task_struct* t, enum timer_action action){
         __hrtimer_start_range_ns(&(zss_timer.timer), ns_to_ktime(zss_timer_start),
                 0, HRTIMER_MODE_ABS_PINNED, 0);
         zss_timer.armed = 1;
+        zss_timer.t = t;
     }
     else{
         BUG_ON("Invalid timer action.\n");
     }
 }
 
-inline static insert_zero_slack_instance(struct task_struct* t){
+inline static void insert_zero_slack_instance(struct task_struct* t){
     lt_t t_zsi;
     t_zsi = tsk_rt(t)->job_params.release + tsk_rt(t)->task_params.mc_param.zsi;
     if(t_zsi < zss_timer.zss_time){
@@ -107,23 +141,56 @@ inline static insert_zero_slack_instance(struct task_struct* t){
     }
 }
 
-inline static remove_zero_slack_instance(struct task_struct* t){
+inline static void remove_zero_slack_instance(struct task_struct* t){
+    struct bheap_node* node;
     bheap_delete(zero_slack_comparator, &zss_instances, tsk_rt(t)->heap_node);
-    struct bheap_node* node = bheap_peek(zero_slack_comparator, &zss_instances);
+    node = bheap_peek(zero_slack_comparator, &zss_instances);
     if(node){
         struct task_struct* next_t = bheap2task(node);
         zss_start_timer(next_t, eRESTART);
     }
 }
 
+/*Update task paramter for criticality change.*/                                
+static int replenish_task_for_mode(struct task_struct* t, unsigned int action){ 
+  int x1, x2 = 0;                                                             
+  int status = 1;                                                             
+  int budget_surplus;                                                         
+																			  
+  if(is_task_eligible(t)){                                                
+	  /*Replenish task if eligible at current criticality.*/                  
+	  if(current_criticality >= 1){                                           
+		  x1 = (tsk_rt(t)->task_params).mc_param.budget[current_criticality]; 
+		  x2 = (tsk_rt(t)->task_params).mc_param.budget[current_criticality - 1];
+		  budget_surplus = x1 - x2;                                           
+																			  
+		  if(action == eRAISE_CRIT){                                          
+			  (tsk_rt(t)->job_params).release += (budget_surplus);            
+		  }                                                                   
+		  else if(action == eLOWER_CRIT){                                     
+			  (tsk_rt(t)->job_params).release -= (budget_surplus);            
+		  }                                                                   
+		  if(!budget_remaining(t)){                                           
+			  prepare_for_next_period(t);                                     
+			  status = 0;                                                     
+		  }                                                                   
+	  }                                                                       
+	  else{                                                                   
+		  TRACE_TASK(t, "Undefined replenishment called for (%d)\n", t->pid); 
+	  }                                                                       
+  }                                                                           
+  return status;                                                              
+}                                                                               
+     
+
 /** ZSS timeout handler. **/
 static enum hrtimer_restart on_zss_timeout(struct hrtimer* timer){
 
      unsigned long flags;
      local_irq_save(flags);
-     zss_tracker_t* tracker = container_of(timer, zss_tracker_t, timer);
      raise_system_criticality();
-     task_immediate_schedule = tracker->t;
+     zss_timer.armed = 0;
+     task_immediate_schedule = zss_timer.t;
      litmus_reschedule_local(); 
      local_irq_restore(flags);
      return HRTIMER_NORESTART;
@@ -132,13 +199,18 @@ static enum hrtimer_restart on_zss_timeout(struct hrtimer* timer){
 static void zss_stop_timer(struct task_struct* t){
     if(t != zss_timer.t)
         TRACE("zss timer stoped by task differing from startin task.\n");
-    if(!hrtimer_try_to_cancel(zss_timer.timer))
+    if(!hrtimer_try_to_cancel(&(zss_timer.timer)))
         TRACE("tried to cancel inactive zss timer.\n");
 }
 
-static int update_timer_if_req(struct task_struct* t){
+static void zss_timer_init(void){
+    hrtimer_init(&(zss_timer.timer), CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+    zss_timer.timer.function = on_zss_timeout;
+}
+
+static void update_timer_if_req(struct task_struct* t){
     
-    lt_t t_zsi = tsk_rt(t)->job_params.release + tsk_rt(at)->task_params.mc_param.zsi;
+    lt_t t_zsi = tsk_rt(t)->job_params.release + tsk_rt(t)->task_params.mc_param.zsi;
     if(t_zsi < zss_timer.zss_time){
         zss_start_timer(t, eRESTART);
     }
@@ -155,7 +227,7 @@ static void preempt(zss_domain_t *zss)
 static inline void zss_update_userspace(struct task_struct* t){
    if(has_control_page(t)){
        struct control_page* cp = get_control_page(t);
-       cp->active_crit = flag;
+       cp->active_crit = current_criticality;
        barrier();
    } 
 }
@@ -242,49 +314,18 @@ static void job_completion(struct task_struct* t, int forced)
 		sched_trace_task_release(t);
 }
 
-/*AMC: For the scheduling policy for which tasks are not
- * allowed to continue even if they were released before
- * criticality change, remove them from the release queue
- * to a temporary queue to be moved back when returning back
- * to prev criticality*/
-static void update_release_queue(){
-    clear_release_heap(&zss_domain->domain, &release_queue_bin, zss_check_criticality, fp_ready_order);
-    TRACE_CUR("Updated the release queue for the current criticality.");
-}
-
-/*AMC: Update runqueue for current criticality similar to release queue.*/
-static void update_runqueue(){
-    bheap_iterate_clear(zss_check_criticality, fp_ready_order,
-            &zss_domain->domain->release_queue, &release_queue_bin);
-    TRACE_CUR("Update the runqueue for the current criticality.");
-}
-
 static void handle_criticality(struct task_struct* prev){
     if(check_budget_overrun(prev)){
-        if(!raise_system_criticality()){
-            if(clear_rq_enabled())
-                update_release_queue();
-            update_runqueue(prev);
-        }
+        raise_system_criticality();
     }
     if(is_task_eligible(prev)){
-        replenish_task_for_mode(prev);
+        replenish_task_for_mode(prev, eRAISE_CRIT);
     }
-}
-
-static int zss_check_criticality(bheap* node){
-    struct task_struct* task = bheap2task(node);
-    return (is_task_eligible(node));
-}
-
-/*Main schedule function. If an idle instance is encountered, reduce criticality. */
-static inline void reduce_criticality(void){
-   (!criticality) ? BUG_ON(criticality) : (criticality -= 1); 
 }
 
 static struct task_struct* zss_schedule(struct task_struct * prev)
 {
-	zss_domain_t* 	zss = zss_domain;
+	zss_domain_t* 	zss = &zss_domain;
 	struct task_struct*	next;
     
 	int out_of_time, sleep, preempt, np, exists, blocks, resched;
@@ -309,9 +350,9 @@ static struct task_struct* zss_schedule(struct task_struct * prev)
     if(system_mode == eCRITICAL_PENDING){
         /*Drop low critical tasks.*/
         prepare_for_next_period(zss->scheduled);
-        next = sched_state_task_picked;
-        system_mode == eCRITICAL;
-        current_criticality = 1; /*To reuse the common macro to check schedulability.*/
+        next = task_immediate_schedule;
+        system_mode = eCRITICAL;
+        raise_system_criticality(); /*To reuse the common macro to check schedulability.*/
         zss_update_userspace(next);
         goto completed;
     }
@@ -417,7 +458,7 @@ return next;
 
 /*Early completion on transition at a zero slack instance.*/
 completed:
-    zss_scheduled = next;
+    zss->scheduled = next;
     sched_state_task_picked();
     raw_spin_unlock(&zss->slock);
     return next;
@@ -427,7 +468,7 @@ completed:
  */
 static void zss_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 {
-	zss_domain_t* 	zss = &zss_schedule;
+	zss_domain_t* 	zss = &zss_domain;
 	unsigned long		flags;
 
 	TRACE_TASK(t, "P-FP: task new, cpu = %d\n",
@@ -452,7 +493,7 @@ static void zss_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 static void zss_task_wake_up(struct task_struct *task)
 {
 	unsigned long		flags;
-	zss_domain_t* 	zss = &zss_schedule;
+	zss_domain_t* 	zss = &zss_domain;
 	lt_t			now;
 
 	TRACE_TASK(task, "wake_up at %llu\n", litmus_clock());
@@ -524,7 +565,7 @@ static void zss_task_block(struct task_struct *t)
 static void zss_task_exit(struct task_struct * t)
 {
 	unsigned long flags;
-	zss_domain_t* 	zss = &zss_schedule;
+	zss_domain_t* 	zss = &zss_domain;
 
 	raw_spin_lock_irqsave(&zss->slock, flags);
 	if (is_queued(t)) {
@@ -616,13 +657,12 @@ static struct sched_plugin zss_plugin __cacheline_aligned_in_smp = {
 
 static int __init init_zss(void)
 {
-	int i;
-
 	/* We do not really want to support cpu hotplug, do we? ;)
 	 * However, if we are so crazy to do so,
 	 * we cannot use num_online_cpu()
 	 */
-	zss_domain_init(zss_domain);
+	zss_domain_init(&zss_domain);
+    zss_timer_init();
 	return register_sched_plugin(&zss_plugin);
 }
 module_init(init_zss);

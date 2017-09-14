@@ -69,7 +69,7 @@ typedef enum{
     eRAISE_CRIT
 }crit_action_t;
 /*ELASTIC Domain variable.*/
-elastic_domain_t local_domain;
+static elastic_domain_t local_domain;
 
 /************************  MC Params: End  ********************************/
 
@@ -106,12 +106,23 @@ static int elastic_slack_order(struct bheap_node* a, struct bheap_node* b){
     return a_parent->deadline > b_parent->deadline;
 }
 
-/*if slack avail recover it.*/
+/*if slack avail recover it.
+ *For a high crit task, it's the delta between high and low crit budget.
+ *For a low crit task, it's the normal budget.
+ * */
 void elastic_retrieve_slack_if_avail(struct task_struct* t){
+    int delta;
+    int deadline;
+    struct slack* snode;
     if(!is_slack_queued(t)){
-        struct slack* snode;
-        int delta = elastic_budget_delta(t);
-        int deadline = tsk_rt(t)->job_params.deadline;
+        if(is_task_high_crit(t)){
+            delta = elastic_budget_delta(t);
+            deadline = tsk_rt(t)->job_params.deadline;
+        }
+        else{
+            delta = tsk_rt(t)->task_params.mc_param.budget[0];
+            deadline = tsk_rt(t)->task_params.mc_param.period[1];
+        }
         tsk_rt(t)->task_params.mc_param.ts.budget = delta;
         tsk_rt(t)->task_params.mc_param.ts.deadline = deadline;
         tsk_rt(t)->task_params.mc_param.ts.queued = 1;
@@ -234,7 +245,7 @@ static int elastic_is_task_eligible(struct task_struct* t){
 }
 
 
-int replenish_task_for_mode(struct task_struct* t){
+static int replenish_task_for_mode(struct task_struct* t){
     
    int delta = elastic_budget_delta(t); 
    if(delta <= 0){
@@ -439,7 +450,7 @@ static struct task_struct* elastic_schedule(struct task_struct * prev){
          * background, or lower the criticality.*/
        // TRACE("becoming idle and lowering criticality at: %llu\n", litmus_clock());
 	}
-    elastic_retrieve_slack_if_avail(next);/*If high crit task, check if slack available.*/
+    elastic_retrieve_slack_if_avail(next);/*update slack queue withs slack component*/
 	elastic->scheduled = next;
 	sched_state_task_picked();
 out:

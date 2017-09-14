@@ -74,12 +74,11 @@ static inline void icg_update_task_interfer(struct task_struct* t, unsigned int 
 /*Mark all the constrained tasks for given task with the new mask.
  *Returns total number of tasks marked. **/
 static int icg_mark_overridden_tasks(struct task_struct* t, int flag){
+    int i;
     int count;
-    int index;
-    struct task_struct* t;
     int mask = tsk_rt(t)->task_params.mc_param.mask;
-    
-    for(int i = 0; i < TOTAL_SKIP_COUNT; i++){
+    count = 0;
+    for(i = 0; i < TOTAL_SKIP_COUNT; i++){
         if(mask & (1 << i)){
             count++;
             t = constrained_indexed_tasks[i];
@@ -122,6 +121,16 @@ static unsigned int priority_index(struct task_struct* t)
 	return get_priority(t);
 }
 
+static void requeue(struct task_struct* t, icg_domain_t *icg)
+{
+	tsk_rt(t)->completed = 0;
+	if (is_released(t, litmus_clock()))
+		fp_prio_add(&icg->ready_queue, t, priority_index(t));
+	else
+		add_release(&icg->domain, t); /* it has got to wait */
+}
+
+
 static void icg_release_jobs(rt_domain_t* rt, struct bheap* tasks)
 {
 	icg_domain_t *icg = container_of(rt, icg_domain_t, domain);
@@ -144,7 +153,7 @@ static void icg_release_jobs(rt_domain_t* rt, struct bheap* tasks)
 	    }
         else{
             prepare_for_next_period(t);
-            requeue(t);
+            requeue(t, icg);
         }
 	}
 	/* do we need to preempt? */
@@ -169,15 +178,6 @@ static void icg_domain_init(icg_domain_t* icg)
 	fp_prio_queue_init(&icg->ready_queue);
 }
 
-static void requeue(struct task_struct* t, icg_domain_t *icg)
-{
-	tsk_rt(t)->completed = 0;
-	if (is_released(t, litmus_clock()))
-		fp_prio_add(&icg->ready_queue, t, priority_index(t));
-	else
-		add_release(&icg->domain, t); /* it has got to wait */
-}
-
 static void job_completion(struct task_struct* t, int forced)
 {
 	sched_trace_task_completion(t, forced);
@@ -185,7 +185,7 @@ static void job_completion(struct task_struct* t, int forced)
     /*Task has completed reenable the masked tasks if any.*/
     if(icg_active_interfer(t)){
         icg_mark_overridden_tasks(t, 0);
-        icg_update_task_interfer(0);
+        icg_update_task_interfer(t, 0);
     }
 	tsk_rt(t)->completed = 0;
 	prepare_for_next_period(t);
@@ -236,10 +236,10 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
         /*Check if task has execution delta left in high mode.
          * if not preempt. Else check for tasks to override.
          * */
-        if(scheduled->mc_param->override_list){
-            icg_update_task_interfer(scheduled);
+        if(tsk_rt(scheduled)->task_params.mc_param.mask){
+            icg_update_task_interfer(scheduled, 1);
             icg_mark_overridden_tasks(scheduled, 1);
-            if(!icg_replenish_task_for_mode(edfvd->scheduled)){
+            if(!icg_replenish_task_for_mode(icg->scheduled)){
                 /*Task has no budget left in high criticality mode as well.
                  * Pick next task.*/
                 mark_complete = 1;
@@ -247,7 +247,7 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
             }
             else{
                 TRACE_TASK("Task moved to high criticality: (%d)\n", scheduled->pid);
-                reched = 0;
+                resched = 0;
             }
         }
         else{
@@ -277,7 +277,7 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
         mark_complete = 0;
         job_completion(scheduled, !sleep);
         icg_mark_overridden_tasks(scheduled, 0);
-        icg_update_task_interfer(0);
+        icg_update_task_interfer(scheduled, 0);
 		resched = 1;
 	}
 
@@ -327,7 +327,7 @@ static struct task_struct* icg_schedule(struct task_struct * prev)
 			next = prev;
 
 	if (next) {
-        icg_update_userspace(next);
+        icg_update_userspace(next, current_criticality);
 		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
 	} else if (exists) {
 		TRACE("becoming idle at %llu\n", litmus_clock());
@@ -467,7 +467,7 @@ static void icg_task_exit(struct task_struct * t)
 	if (is_queued(t)) {
 		BUG(); /* This currently doesn't work. */
 		/* dequeue */
-		dom  = icg_domain;
+		dom  = &(icg->domain);
 		remove(dom, t);
 	}
 	if (icg->scheduled == t) {
@@ -551,17 +551,11 @@ static struct sched_plugin icg_plugin __cacheline_aligned_in_smp = {
 	.activate_plugin	= icg_activate_plugin,
 	.deactivate_plugin	= icg_deactivate_plugin,
 	.get_domain_proc_info	= icg_get_domain_proc_info,
-#ifdef CONFIG_LITMUS_LOCKING
-	.allocate_lock		= icg_allocate_lock,
-	.finish_switch		= icg_finish_switch,
-#endif
 };
 
 
 static int __init init_icg(void)
 {
-	int i;
-
 	/* We do not really want to support cpu hotplug, do we? ;)
 	 * However, if we are so crazy to do so,
 	 * we cannot use num_online_cpu()

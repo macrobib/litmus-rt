@@ -20,11 +20,11 @@
 #include <litmus/sched_trace.h>
 #include <litmus/trace.h>
 #include <litmus/budget.h>
+#include <litmus/litmus.h>
 
 /* to set up domain/cpu mappings */
 #include <litmus/litmus_proc.h>
 #include <linux/uaccess.h>
-
 
 typedef struct {
 	rt_domain_t 		domain;
